@@ -9,6 +9,14 @@ BIN_DIR="${APP_DIR}/Contents/MacOS"
 RES_DIR="${APP_DIR}/Contents/Resources"
 PLIST_PATH="${APP_DIR}/Contents/Info.plist"
 LAUNCH_AGENT="$HOME/Library/LaunchAgents/${BUNDLE_ID}.plist"
+LEGACY_AGENT_LABELS=(
+  "com.nicholas.quickask"
+  "com.nicholas.quick-ask"
+)
+LEGACY_AGENT_PATHS=(
+  "$HOME/Library/LaunchAgents/com.nicholas.quickask.plist"
+  "$HOME/Library/LaunchAgents/com.nicholas.quick-ask.plist"
+)
 
 mkdir -p "$BIN_DIR" "$RES_DIR" "$HOME/Applications" "$HOME/Library/LaunchAgents"
 
@@ -76,6 +84,14 @@ cat > "$LAUNCH_AGENT" <<PLIST
 </dict>
 </plist>
 PLIST
+
+for label in "${LEGACY_AGENT_LABELS[@]}"; do
+  launchctl bootout "gui/$(id -u)/${label}" >/dev/null 2>&1 || true
+done
+
+for agent_path in "${LEGACY_AGENT_PATHS[@]}"; do
+  rm -f "$agent_path"
+done
 
 launchctl bootout "gui/$(id -u)" "$LAUNCH_AGENT" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT"

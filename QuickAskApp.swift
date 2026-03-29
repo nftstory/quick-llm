@@ -1,6 +1,44 @@
 import AppKit
 import Carbon.HIToolbox
+import Darwin
 import SwiftUI
+
+final class QuickAskLog {
+    static let shared = QuickAskLog()
+
+    private let queue = DispatchQueue(label: "app.quickask.log", qos: .utility)
+    private let formatter: ISO8601DateFormatter
+    private let logURL: URL
+
+    private init() {
+        let logsDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/Quick Ask", isDirectory: true)
+        try? FileManager.default.createDirectory(at: logsDirectory, withIntermediateDirectories: true)
+        self.logURL = logsDirectory.appendingPathComponent("quick-ask.log", isDirectory: false)
+        self.formatter = ISO8601DateFormatter()
+        self.formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    }
+
+    func write(_ message: String) {
+        let timestamp = formatter.string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        queue.async {
+            guard let data = line.data(using: .utf8) else { return }
+            if FileManager.default.fileExists(atPath: self.logURL.path) {
+                do {
+                    let handle = try FileHandle(forWritingTo: self.logURL)
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: data)
+                    try handle.close()
+                } catch {
+                    return
+                }
+            } else {
+                try? data.write(to: self.logURL, options: .atomic)
+            }
+        }
+    }
+}
 
 struct ChatMessage: Identifiable, Equatable {
     enum Role: String {
@@ -133,6 +171,76 @@ private enum QuickAskTheme {
     static let panelAccent = Color.white.opacity(0.18)
 }
 
+@MainActor
+final class QuickAskAppSettings: ObservableObject {
+    @Published private(set) var customArchiveDirectoryPath: String
+
+    private let defaults: UserDefaults
+    private let archiveDirectoryKey = "QuickAskCustomArchiveDirectory"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        self.customArchiveDirectoryPath = defaults.string(forKey: archiveDirectoryKey) ?? ""
+    }
+
+    var customArchiveDirectory: URL? {
+        let trimmed = customArchiveDirectoryPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath).standardizedFileURL
+    }
+
+    var usesAutomaticArchiveDirectory: Bool {
+        customArchiveDirectory == nil
+    }
+
+    var resolvedArchiveDirectory: URL {
+        if let customArchiveDirectory {
+            return customArchiveDirectory
+        }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let dropboxCandidates = [
+            home.appendingPathComponent("Library/CloudStorage/Dropbox", isDirectory: true),
+            home.appendingPathComponent("Dropbox", isDirectory: true),
+        ]
+        for base in dropboxCandidates where FileManager.default.fileExists(atPath: base.path) {
+            return base.appendingPathComponent("local-llm-chat/sessions", isDirectory: true)
+        }
+
+        return home.appendingPathComponent("Library/Application Support/Quick Ask/sessions", isDirectory: true)
+    }
+
+    var archiveDirectorySummary: String {
+        usesAutomaticArchiveDirectory ? "Automatic" : "Custom"
+    }
+
+    var archiveDirectoryDetail: String {
+        resolvedArchiveDirectory.path
+    }
+
+    func processEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        if let customArchiveDirectory {
+            environment["QUICK_ASK_SAVE_DIR"] = customArchiveDirectory.path
+        } else {
+            environment.removeValue(forKey: "QUICK_ASK_SAVE_DIR")
+        }
+        return environment
+    }
+
+    func setCustomArchiveDirectory(_ url: URL) {
+        let standardized = url.standardizedFileURL
+        try? FileManager.default.createDirectory(at: standardized, withIntermediateDirectories: true)
+        customArchiveDirectoryPath = standardized.path
+        defaults.set(standardized.path, forKey: archiveDirectoryKey)
+    }
+
+    func clearCustomArchiveDirectory() {
+        customArchiveDirectoryPath = ""
+        defaults.removeObject(forKey: archiveDirectoryKey)
+    }
+}
+
 private struct CodableRect: Codable {
     let x: Double
     let y: Double
@@ -150,6 +258,7 @@ private struct CodableRect: Codable {
 private struct QuickAskUITestState: Codable {
     let panelVisible: Bool
     let historyWindowVisible: Bool
+    let panelIsKeyWindow: Bool
     let panelFrame: CodableRect
     let inputBarFrame: CodableRect
     let inputBarBottomInset: Double
@@ -157,7 +266,10 @@ private struct QuickAskUITestState: Codable {
     let messageCount: Int
     let queuedCount: Int
     let isGenerating: Bool
+    let focusRequestCount: Int
+    let frontmostAppName: String
     let selectedModel: String
+    let inputText: String
     let handledCommandID: Int
 }
 
@@ -184,11 +296,13 @@ final class QuickAskViewModel: ObservableObject {
     @Published var selectedModelID = "claude::claude-opus-4-6"
     @Published var isGenerating = false
     @Published var focusToken = UUID()
+    @Published private(set) var focusRequestCount = 0
     @Published var statusText = ""
 
     weak var layoutDelegate: QuickAskLayoutDelegate?
 
     private let backendPath: String
+    private let processEnvironmentProvider: () -> [String: String]
     private let defaults = UserDefaults.standard
     private let lastModelKey = "QuickAskSelectedModelID"
     private let idleTimeout: TimeInterval = 45
@@ -203,10 +317,12 @@ final class QuickAskViewModel: ObservableObject {
     private var sessionCreatedAt = QuickAskViewModel.timestampString(for: Date())
     private let saveQueue = DispatchQueue(label: "app.quickask.save", qos: .utility)
     private var pendingResetAfterTermination = false
+    private var pendingResetPreserveInput = false
     private var pendingSteerAfterTermination = false
 
-    init(backendPath: String) {
+    init(backendPath: String, processEnvironmentProvider: @escaping () -> [String: String]) {
         self.backendPath = backendPath
+        self.processEnvironmentProvider = processEnvironmentProvider
         if let storedModel = defaults.string(forKey: lastModelKey), !storedModel.isEmpty {
             selectedModelID = storedModel
         }
@@ -218,6 +334,8 @@ final class QuickAskViewModel: ObservableObject {
     }
 
     func requestFocus() {
+        QuickAskLog.shared.write("view-model requestFocus")
+        focusRequestCount += 1
         focusToken = UUID()
     }
 
@@ -227,11 +345,13 @@ final class QuickAskViewModel: ObservableObject {
 
     func panelShown() {
         touch()
+        QuickAskLog.shared.write("panel shown")
         requestFocus()
     }
 
     func panelHidden() {
         touch()
+        QuickAskLog.shared.write("panel hidden")
         saveTranscript()
     }
 
@@ -253,10 +373,12 @@ final class QuickAskViewModel: ObservableObject {
 
     func loadModels() {
         let backendPath = self.backendPath
+        let processEnvironment = self.processEnvironmentProvider()
         Task.detached(priority: .userInitiated) {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = ["python3", backendPath, "models"]
+            process.environment = processEnvironment
             let stdout = Pipe()
             let stderr = Pipe()
             process.standardOutput = stdout
@@ -302,13 +424,17 @@ final class QuickAskViewModel: ObservableObject {
         touch()
     }
 
-    func clearHistory() {
+    func clearHistory(preserveInput: Bool = false, preserveStatus: Bool = false) {
         saveTranscript()
         messages = []
         queuedPrompts = []
         historyAreaHeight = 0
-        inputText = ""
-        statusText = ""
+        if !preserveInput {
+            inputText = ""
+        }
+        if !preserveStatus {
+            statusText = ""
+        }
         activeAssistantMessageID = nil
         resetSessionIfNeeded()
         layoutDelegate?.quickAskNeedsLayout()
@@ -348,12 +474,22 @@ final class QuickAskViewModel: ObservableObject {
 
     func newChat() {
         touch()
+        let isAlreadyFreshChat = messages.isEmpty && queuedPrompts.isEmpty
         if isGenerating {
             pendingResetAfterTermination = true
+            pendingResetPreserveInput = !isAlreadyFreshChat
             cancelActiveGeneration()
             return
         }
-        clearHistory()
+
+        if isAlreadyFreshChat {
+            inputText = ""
+            layoutDelegate?.quickAskNeedsLayout()
+            requestFocus()
+            return
+        }
+
+        clearHistory(preserveInput: true, preserveStatus: true)
         requestFocus()
     }
 
@@ -373,6 +509,26 @@ final class QuickAskViewModel: ObservableObject {
         startGeneration(for: trimmed)
     }
 
+    func steerCurrentInput() {
+        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            steerQueuedPrompt()
+            return
+        }
+
+        touch()
+        inputText = ""
+        if isGenerating {
+            queuedPrompts.insert(QueuedPrompt(content: trimmed), at: 0)
+            layoutDelegate?.quickAskNeedsLayout()
+            pendingSteerAfterTermination = true
+            cancelActiveGeneration()
+            return
+        }
+
+        startGeneration(for: trimmed)
+    }
+
     func steerQueuedPrompt() {
         touch()
         guard !queuedPrompts.isEmpty else { return }
@@ -382,6 +538,17 @@ final class QuickAskViewModel: ObservableObject {
             return
         }
         sendNextQueuedPrompt()
+    }
+
+    func clearQueuedPrompts() {
+        touch()
+        pendingSteerAfterTermination = false
+        queuedPrompts = []
+        layoutDelegate?.quickAskNeedsLayout()
+    }
+
+    func persistCurrentTranscript() {
+        saveTranscript()
     }
 
     private func startGeneration(for prompt: String) {
@@ -402,6 +569,7 @@ final class QuickAskViewModel: ObservableObject {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["python3", backendPath, "chat", "--model-id", selectedModelID]
+        process.environment = processEnvironmentProvider()
 
         let stdin = Pipe()
         let stdout = Pipe()
@@ -553,7 +721,9 @@ final class QuickAskViewModel: ObservableObject {
 
         if pendingResetAfterTermination {
             pendingResetAfterTermination = false
-            clearHistory()
+            let preserveInput = pendingResetPreserveInput
+            pendingResetPreserveInput = false
+            clearHistory(preserveInput: preserveInput, preserveStatus: true)
             requestFocus()
             return
         }
@@ -601,6 +771,7 @@ final class QuickAskViewModel: ObservableObject {
         let sessionID = self.sessionID
         let sessionCreatedAt = self.sessionCreatedAt
         let modelID = self.selectedModelID
+        let processEnvironment = self.processEnvironmentProvider()
 
         saveQueue.async {
             let process = Process()
@@ -616,6 +787,7 @@ final class QuickAskViewModel: ObservableObject {
                 "--model-id",
                 modelID,
             ]
+            process.environment = processEnvironment
 
             let stdin = Pipe()
             process.standardInput = stdin
@@ -665,15 +837,21 @@ final class QuickAskHistoryViewModel: ObservableObject {
     @Published var statusText = ""
 
     private let backendPath: String
+    private let processEnvironmentProvider: () -> [String: String]
 
-    init(backendPath: String) {
+    init(backendPath: String, processEnvironmentProvider: @escaping () -> [String: String]) {
         self.backendPath = backendPath
+        self.processEnvironmentProvider = processEnvironmentProvider
     }
 
-    nonisolated private static func fetchHistory(backendPath: String) -> (payload: QuickAskHistoryEnvelope?, message: String?) {
+    nonisolated private static func fetchHistory(
+        backendPath: String,
+        processEnvironment: [String: String]
+    ) -> (payload: QuickAskHistoryEnvelope?, message: String?) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["python3", backendPath, "history", "--limit", "200"]
+        process.environment = processEnvironment
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -704,9 +882,13 @@ final class QuickAskHistoryViewModel: ObservableObject {
         statusText = ""
 
         let backendPath = self.backendPath
+        let processEnvironment = self.processEnvironmentProvider()
         Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
-                QuickAskHistoryViewModel.fetchHistory(backendPath: backendPath)
+                QuickAskHistoryViewModel.fetchHistory(
+                    backendPath: backendPath,
+                    processEnvironment: processEnvironment
+                )
             }.value
             guard let self else { return }
             if let payload = result.payload {
@@ -746,45 +928,45 @@ struct QuickAskHistoryRow: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: 10) {
-                Text(session.preview.isEmpty ? "Untitled session" : session.preview)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(QuickAskTheme.strongText)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(session.preview.isEmpty ? "Untitled session" : session.preview)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(QuickAskTheme.strongText)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
 
-                Text("\(session.messageCount)")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(QuickAskTheme.strongText)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(Rectangle().fill(QuickAskTheme.panelAccent))
-                    .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
+                    HStack(spacing: 8) {
+                        if !session.model.isEmpty {
+                            Text(session.model)
+                                .font(.system(size: 11, weight: .regular))
+                                .foregroundStyle(QuickAskTheme.mutedText)
+                                .lineLimit(1)
+                        }
+                        Text(relativeSavedAtText)
+                            .font(.system(size: 11, weight: .regular))
+                            .foregroundStyle(QuickAskTheme.mutedText)
+                            .lineLimit(1)
+                    }
+                }
+
+                VStack(alignment: .trailing, spacing: 8) {
+                    Text("\(session.messageCount)")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(QuickAskTheme.strongText)
+
+                    Text("restore")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(QuickAskTheme.strongText.opacity(0.82))
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 11)
-            .background(QuickAskTheme.inputBackground)
-
-            HStack(spacing: 8) {
-                if !session.model.isEmpty {
-                    Text(session.model)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(QuickAskTheme.strongText)
-                        .lineLimit(1)
-                }
-                Text(relativeSavedAtText)
-                        .font(.system(size: 11))
-                        .foregroundStyle(QuickAskTheme.mutedText)
-                        .lineLimit(1)
-                Spacer(minLength: 8)
-                Text("restore")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(QuickAskTheme.strongText.opacity(0.82))
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
             .background(QuickAskTheme.historyBackground)
+
+            Rectangle()
+                .fill(QuickAskTheme.dividerColor)
+                .frame(height: 1)
         }
-        .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
     }
 }
 
@@ -798,10 +980,7 @@ struct QuickAskHistoryView: View {
             .buttonStyle(.plain)
             .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(QuickAskTheme.strongText)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(Rectangle().fill(QuickAskTheme.panelAccent))
-            .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
+            .padding(.vertical, 2)
     }
 
     var body: some View {
@@ -819,6 +998,9 @@ struct QuickAskHistoryView: View {
                 commandButton("Refresh") {
                     viewModel.reload()
                 }
+                Rectangle()
+                    .fill(QuickAskTheme.dividerColor)
+                    .frame(width: 1, height: 18)
                 commandButton("Close") {
                     onClose()
                 }
@@ -826,7 +1008,10 @@ struct QuickAskHistoryView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
             .background(QuickAskTheme.inputBackground)
-            .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
+
+            Rectangle()
+                .fill(QuickAskTheme.dividerColor)
+                .frame(height: 1)
 
             Group {
                 if viewModel.sessions.isEmpty {
@@ -845,7 +1030,7 @@ struct QuickAskHistoryView: View {
                     .background(QuickAskTheme.historyBackground)
                 } else {
                     ScrollView {
-                        LazyVStack(spacing: 10) {
+                        LazyVStack(spacing: 0) {
                             ForEach(viewModel.sessions) { session in
                                 Button {
                                     onSelectSession(session)
@@ -856,20 +1041,90 @@ struct QuickAskHistoryView: View {
                             }
                         }
                     }
-                    .padding(10)
                     .background(QuickAskTheme.historyBackground)
                 }
             }
-            .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
         }
         .frame(minWidth: 520, minHeight: 420)
         .background(QuickAskTheme.frameBackground)
-        .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
         .onAppear {
             if viewModel.sessions.isEmpty {
                 viewModel.reload()
             }
         }
+    }
+}
+
+struct QuickAskSettingsView: View {
+    @ObservedObject var settings: QuickAskAppSettings
+    let onChooseArchiveDirectory: () -> Void
+    let onUseAutomaticArchiveDirectory: () -> Void
+    let onClose: () -> Void
+
+    private func commandButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.plain)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(QuickAskTheme.strongText)
+            .padding(.vertical, 2)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Quick Ask Settings")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(QuickAskTheme.strongText)
+                    Text("Choose where encrypted transcripts are stored.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(QuickAskTheme.mutedText)
+                }
+                Spacer()
+                commandButton("Close") {
+                    onClose()
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(QuickAskTheme.inputBackground)
+
+            Rectangle()
+                .fill(QuickAskTheme.dividerColor)
+                .frame(height: 1)
+
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Archive Folder")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(QuickAskTheme.strongText)
+                    Text("\(settings.archiveDirectorySummary): \(settings.archiveDirectoryDetail)")
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(QuickAskTheme.mutedText)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                HStack(spacing: 8) {
+                    commandButton("Choose Folder…") {
+                        onChooseArchiveDirectory()
+                    }
+                    commandButton("Use Automatic") {
+                        onUseAutomaticArchiveDirectory()
+                    }
+                }
+
+                Text("Automatic uses Dropbox when available, otherwise it falls back to Quick Ask’s local app-support folder.")
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(QuickAskTheme.mutedText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(QuickAskTheme.historyBackground)
+        }
+        .frame(minWidth: 520, minHeight: 190)
+        .background(QuickAskTheme.frameBackground)
     }
 }
 
@@ -978,6 +1233,8 @@ final class HotKeyManager {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    @State private var isHovering = false
+    @State private var justCopied = false
 
     private var bubbleColor: Color {
         switch message.role {
@@ -992,6 +1249,21 @@ struct MessageBubble: View {
         QuickAskTheme.strongText
     }
 
+    private var canCopy: Bool {
+        !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func copyMessage() {
+        guard canCopy else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(message.content, forType: .string)
+        justCopied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+            justCopied = false
+        }
+    }
+
     var body: some View {
         HStack {
             if message.role == .user { Spacer(minLength: 40) }
@@ -1001,6 +1273,7 @@ struct MessageBubble: View {
                 .textSelection(.enabled)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
+                .padding(.trailing, canCopy ? 24 : 10)
                 .frame(maxWidth: 360, alignment: .leading)
                 .background(
                     Rectangle()
@@ -1010,6 +1283,24 @@ struct MessageBubble: View {
                     Rectangle()
                         .stroke(Color.black.opacity(0.18), lineWidth: 1)
                 )
+                .overlay(alignment: .topTrailing) {
+                    if canCopy {
+                        Button(action: copyMessage) {
+                            Image(systemName: justCopied ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(QuickAskTheme.strongText.opacity(0.78))
+                                .frame(width: 18, height: 18)
+                                .background(Rectangle().fill(Color.white.opacity(0.18)))
+                                .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                        .opacity(isHovering || justCopied ? 1 : 0)
+                        .padding(5)
+                    }
+                }
+                .onHover { hovering in
+                    isHovering = hovering
+                }
             if message.role == .assistant { Spacer(minLength: 40) }
         }
         .frame(maxWidth: .infinity)
@@ -1038,9 +1329,149 @@ struct QueuedPromptRow: View {
     }
 }
 
+struct SuggestionFreeInputField: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+    let focusToken: UUID
+    let onSubmit: () -> Void
+    let onSteerSubmit: () -> Void
+    let onTextChange: () -> Void
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: SuggestionFreeInputField
+        var lastFocusToken: UUID?
+
+        init(parent: SuggestionFreeInputField) {
+            self.parent = parent
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            if parent.text != field.stringValue {
+                parent.text = field.stringValue
+            }
+            parent.onTextChange()
+            configureEditor(for: field)
+        }
+
+        func controlTextDidBeginEditing(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            configureEditor(for: field)
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) ||
+                commandSelector == #selector(NSResponder.insertLineBreak(_:)) {
+                let flags = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
+                if flags.contains(.command) {
+                    parent.onSteerSubmit()
+                } else {
+                    parent.onSubmit()
+                }
+                return true
+            }
+            return false
+        }
+
+        func control(
+            _ control: NSControl,
+            textView: NSTextView,
+            completions words: [String],
+            forPartialWordRange charRange: NSRange,
+            indexOfSelectedItem index: UnsafeMutablePointer<Int>
+        ) -> [String] {
+            index.pointee = -1
+            return []
+        }
+
+        func configureEditor(for field: NSTextField) {
+            guard let editor = field.currentEditor() as? NSTextView else { return }
+            editor.isAutomaticTextCompletionEnabled = false
+            editor.isAutomaticTextReplacementEnabled = false
+            editor.isAutomaticQuoteSubstitutionEnabled = false
+            editor.isAutomaticDashSubstitutionEnabled = false
+            editor.isAutomaticSpellingCorrectionEnabled = false
+            editor.isContinuousSpellCheckingEnabled = false
+            editor.isGrammarCheckingEnabled = false
+            editor.smartInsertDeleteEnabled = false
+            editor.enabledTextCheckingTypes = 0
+        }
+
+        func requestFocus(for field: NSTextField, token: UUID) {
+            guard lastFocusToken != token else { return }
+            lastFocusToken = token
+            QuickAskLog.shared.write("input focus requested")
+            focus(field, attemptsRemaining: 6)
+        }
+
+        private func focus(_ field: NSTextField, attemptsRemaining: Int) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+                guard let window = field.window else {
+                    QuickAskLog.shared.write("input focus retry waiting for window attempts=\(attemptsRemaining)")
+                    if attemptsRemaining > 0 {
+                        self.focus(field, attemptsRemaining: attemptsRemaining - 1)
+                    }
+                    return
+                }
+                guard window.isKeyWindow else {
+                    QuickAskLog.shared.write("input focus skipped because window is not key attempts=\(attemptsRemaining)")
+                    if attemptsRemaining > 0 {
+                        self.focus(field, attemptsRemaining: attemptsRemaining - 1)
+                    }
+                    return
+                }
+                let didFocus = window.makeFirstResponder(field)
+                self.configureEditor(for: field)
+                if let editor = field.currentEditor() as? NSTextView {
+                    editor.setSelectedRange(NSRange(location: field.stringValue.count, length: 0))
+                }
+                QuickAskLog.shared.write("input focus result didFocus=\(didFocus)")
+                if !didFocus, attemptsRemaining > 0 {
+                    self.focus(field, attemptsRemaining: attemptsRemaining - 1)
+                }
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField(string: text)
+        field.delegate = context.coordinator
+        field.placeholderAttributedString = NSAttributedString(
+            string: placeholder,
+            attributes: [
+                .foregroundColor: NSColor(calibratedRed: 0.03, green: 0.16, blue: 0.16, alpha: 0.56),
+                .font: NSFont.systemFont(ofSize: 14, weight: .regular),
+            ]
+        )
+        field.font = NSFont.systemFont(ofSize: 14, weight: .regular)
+        field.textColor = NSColor(calibratedRed: 0.03, green: 0.16, blue: 0.16, alpha: 1)
+        field.isBezeled = false
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.maximumNumberOfLines = 1
+        field.lineBreakMode = .byTruncatingTail
+        field.usesSingleLineMode = true
+        field.isAutomaticTextCompletionEnabled = false
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        if field.stringValue != text {
+            field.stringValue = text
+        }
+        context.coordinator.requestFocus(for: field, token: focusToken)
+    }
+}
+
 struct QuickAskView: View {
     @ObservedObject var viewModel: QuickAskViewModel
-    @FocusState private var inputFocused: Bool
+    let onOpenSettings: () -> Void
 
     private func actionButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(title, action: action)
@@ -1093,6 +1524,9 @@ struct QuickAskView: View {
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(QuickAskTheme.mutedText)
                         Spacer()
+                        actionButton("Cancel") {
+                            viewModel.clearQueuedPrompts()
+                        }
                         actionButton("Steer") {
                             viewModel.steerQueuedPrompt()
                         }
@@ -1117,6 +1551,12 @@ struct QuickAskView: View {
                                 Text(model.shortLabel)
                             }
                         }
+                        Divider()
+                        Button {
+                            onOpenSettings()
+                        } label: {
+                            Text("Settings…")
+                        }
                     } label: {
                         Text(currentModelShortLabel)
                             .lineLimit(1)
@@ -1140,17 +1580,20 @@ struct QuickAskView: View {
                         .fill(QuickAskTheme.dividerColor)
                         .frame(width: 1, height: 24)
 
-                    TextField("Ask quickly…", text: $viewModel.inputText)
-                        .textFieldStyle(.plain)
-                        .foregroundStyle(QuickAskTheme.strongText)
-                        .font(.system(size: 14, weight: .regular))
-                        .focused($inputFocused)
-                        .onSubmit {
+                    SuggestionFreeInputField(
+                        text: $viewModel.inputText,
+                        placeholder: "Ask quickly…",
+                        focusToken: viewModel.focusToken,
+                        onSubmit: {
                             viewModel.send()
-                        }
-                        .onChange(of: viewModel.inputText) { _, _ in
+                        },
+                        onSteerSubmit: {
+                            viewModel.steerCurrentInput()
+                        },
+                        onTextChange: {
                             viewModel.touch()
                         }
+                    )
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 10)
@@ -1178,14 +1621,6 @@ struct QuickAskView: View {
         }
         .frame(width: 560)
         .background(QuickAskTheme.frameBackground)
-        .onAppear {
-            inputFocused = true
-        }
-        .onChange(of: viewModel.focusToken) { _, _ in
-            DispatchQueue.main.async {
-                inputFocused = true
-            }
-        }
         .onPreferenceChange(InputBarFrameKey.self) { value in
             viewModel.setInputBarFrame(value)
         }
@@ -1274,9 +1709,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     private var hostingView: MovableHostingView<QuickAskView>!
     private var historyWindow: NSWindow!
     private var historyHostingView: NSHostingView<QuickAskHistoryView>!
+    private var settingsWindow: NSWindow!
+    private var settingsHostingView: NSHostingView<QuickAskSettingsView>!
     private var historyViewModel: QuickAskHistoryViewModel!
     private var hotKeyManager: HotKeyManager?
     private var viewModel: QuickAskViewModel!
+    private var settings: QuickAskAppSettings!
     private var localKeyMonitor: Any?
     private var panelBottomY: CGFloat?
     private var isProgrammaticPanelMove = false
@@ -1284,16 +1722,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     private let defaults = UserDefaults.standard
     private let panelOriginXKey = "QuickAskPanelOriginX"
     private let panelBottomYKey = "QuickAskPanelBottomY"
+    private let uiTestMode = ProcessInfo.processInfo.environment["QUICK_ASK_UI_TEST_MODE"] == "1"
+    private let uiTestSingletonMode = ProcessInfo.processInfo.environment["QUICK_ASK_UI_TEST_ENABLE_SINGLETON"] == "1"
+    private var singletonLockFileDescriptor: Int32 = -1
+    private var frontmostAppName = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        QuickAskLog.shared.write("applicationDidFinishLaunching uiTestMode=\(uiTestMode)")
+        frontmostAppName = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(handleFrontmostApplicationChanged(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+
+        if !uiTestMode || uiTestSingletonMode {
+            guard acquireSingletonLock() else {
+                QuickAskLog.shared.write("singleton lock unavailable, exiting duplicate instance")
+                NSApp.terminate(nil)
+                return
+            }
+        }
 
         let backendPath = resolveBackendPath()
-        viewModel = QuickAskViewModel(backendPath: backendPath)
+        settings = QuickAskAppSettings(defaults: defaults)
+        viewModel = QuickAskViewModel(
+            backendPath: backendPath,
+            processEnvironmentProvider: { [weak self] in
+                self?.settings.processEnvironment() ?? ProcessInfo.processInfo.environment
+            }
+        )
         viewModel.layoutDelegate = self
-        historyViewModel = QuickAskHistoryViewModel(backendPath: backendPath)
+        historyViewModel = QuickAskHistoryViewModel(
+            backendPath: backendPath,
+            processEnvironmentProvider: { [weak self] in
+                self?.settings.processEnvironment() ?? ProcessInfo.processInfo.environment
+            }
+        )
 
-        hostingView = MovableHostingView(rootView: QuickAskView(viewModel: viewModel))
+        hostingView = MovableHostingView(
+            rootView: QuickAskView(
+                viewModel: viewModel,
+                onOpenSettings: { [weak self] in
+                    self?.showSettingsWindow()
+                }
+            )
+        )
         hostingView.frame = NSRect(x: 0, y: 0, width: 560, height: 70)
 
         historyHostingView = NSHostingView(
@@ -1304,6 +1780,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                 },
                 onClose: { [weak self] in
                     self?.hideHistoryWindow()
+                }
+            )
+        )
+
+        settingsHostingView = NSHostingView(
+            rootView: QuickAskSettingsView(
+                settings: settings,
+                onChooseArchiveDirectory: { [weak self] in
+                    self?.chooseArchiveDirectory()
+                },
+                onUseAutomaticArchiveDirectory: { [weak self] in
+                    self?.useAutomaticArchiveDirectory()
+                },
+                onClose: { [weak self] in
+                    self?.hideSettingsWindow()
                 }
             )
         )
@@ -1348,7 +1839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         historyWindow.hasShadow = true
         historyWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         historyWindow.hidesOnDeactivate = false
-        historyWindow.isMovableByWindowBackground = true
+        historyWindow.isMovableByWindowBackground = false
         historyWindow.contentView = historyHostingView
         historyWindow.setFrameAutosaveName("QuickAskHistoryWindowFrame")
         if !historyWindow.setFrameUsingName("QuickAskHistoryWindowFrame") {
@@ -1361,6 +1852,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             name: NSWindow.didMoveNotification,
             object: historyWindow
         )
+
+        settingsWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 220),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        settingsWindow.title = "Quick Ask Settings"
+        settingsWindow.isReleasedWhenClosed = false
+        settingsWindow.isOpaque = true
+        settingsWindow.backgroundColor = NSColor(calibratedRed: 0.55, green: 0.79, blue: 0.77, alpha: 1)
+        settingsWindow.level = .floating
+        settingsWindow.hasShadow = true
+        settingsWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        settingsWindow.hidesOnDeactivate = false
+        settingsWindow.contentView = settingsHostingView
+        settingsWindow.setFrameAutosaveName("QuickAskSettingsWindowFrame")
+        if !settingsWindow.setFrameUsingName("QuickAskSettingsWindowFrame") {
+            settingsWindow.setFrame(NSRect(x: 0, y: 0, width: 520, height: 220), display: false)
+        }
+        settingsWindow.orderOut(nil)
 
         hotKeyManager = HotKeyManager { [weak self] in
             self?.togglePanel()
@@ -1382,7 +1894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                self.panel.isKeyWindow,
                flags == [.command],
                (event.keyCode == UInt16(kVK_Return) || event.keyCode == UInt16(kVK_ANSI_KeypadEnter)) {
-                self.viewModel.steerQueuedPrompt()
+                self.viewModel.steerCurrentInput()
                 return nil
             }
             return event
@@ -1392,6 +1904,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         quickAskNeedsLayout()
         uiTestHarness = QuickAskUITestHarness(appDelegate: self)
         uiTestHarness?.writeState()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        QuickAskLog.shared.write("applicationWillTerminate")
+        if singletonLockFileDescriptor >= 0 {
+            flock(singletonLockFileDescriptor, LOCK_UN)
+            close(singletonLockFileDescriptor)
+            singletonLockFileDescriptor = -1
+        }
     }
 
     func quickAskNeedsLayout() {
@@ -1404,7 +1926,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         var frame = panel.frame
         isProgrammaticPanelMove = true
         if !panel.isVisible {
-            if let savedOriginX = defaults.object(forKey: panelOriginXKey) as? Double,
+            if uiTestMode {
+                frame = NSRect(x: 700, y: 90, width: targetWidth, height: targetHeight)
+            } else if let savedOriginX = defaults.object(forKey: panelOriginXKey) as? Double,
                let savedBottomY = defaults.object(forKey: panelBottomYKey) as? Double {
                 frame = NSRect(
                     x: round(savedOriginX),
@@ -1440,14 +1964,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         uiTestHarness?.writeState()
     }
 
+    private func showSettingsWindow() {
+        settingsWindow.makeKeyAndOrderFront(nil)
+        settingsWindow.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        uiTestHarness?.writeState()
+    }
+
+    private func hideSettingsWindow() {
+        settingsWindow.orderOut(nil)
+        uiTestHarness?.writeState()
+    }
+
+    private func chooseArchiveDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Choose"
+        panel.title = "Choose Archive Folder"
+        panel.directoryURL = settings.resolvedArchiveDirectory.deletingLastPathComponent()
+        if panel.runModal() == .OK, let url = panel.url {
+            settings.setCustomArchiveDirectory(url)
+            viewModel.persistCurrentTranscript()
+            historyViewModel.reload()
+        }
+    }
+
+    private func useAutomaticArchiveDirectory() {
+        settings.clearCustomArchiveDirectory()
+        viewModel.persistCurrentTranscript()
+        historyViewModel.reload()
+    }
+
     private func togglePanel() {
         if panel.isVisible {
+            QuickAskLog.shared.write("togglePanel hiding panel")
+            if historyWindow.isVisible {
+                hideHistoryWindow()
+            }
+            if settingsWindow.isVisible {
+                hideSettingsWindow()
+            }
             viewModel.panelHidden()
             panel.orderOut(nil)
             uiTestHarness?.writeState()
             return
         }
 
+        QuickAskLog.shared.write("togglePanel showing panel")
         quickAskNeedsLayout()
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
@@ -1459,6 +2025,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 
     private func showPanel() {
+        QuickAskLog.shared.write("showPanel")
         quickAskNeedsLayout()
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
@@ -1471,10 +2038,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
 
     private func toggleHistoryWindow() {
         if historyWindow.isVisible {
+            QuickAskLog.shared.write("toggleHistoryWindow hiding history")
             hideHistoryWindow()
             return
         }
 
+        QuickAskLog.shared.write("toggleHistoryWindow showing history")
         historyViewModel.reload()
         historyWindow.makeKeyAndOrderFront(nil)
         historyWindow.orderFrontRegardless()
@@ -1483,6 +2052,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 
     private func hideHistoryWindow() {
+        QuickAskLog.shared.write("hideHistoryWindow")
         historyWindow.saveFrame(usingName: "QuickAskHistoryWindowFrame")
         historyWindow.orderOut(nil)
         uiTestHarness?.writeState()
@@ -1515,6 +2085,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         return NSRect(x: x, y: y, width: width, height: height)
     }
 
+    private func acquireSingletonLock() -> Bool {
+        let supportRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Quick Ask", isDirectory: true)
+        try? FileManager.default.createDirectory(at: supportRoot, withIntermediateDirectories: true)
+        let lockPath = supportRoot.appendingPathComponent("instance.lock").path
+        let descriptor = open(lockPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            QuickAskLog.shared.write("singleton lock open failed, allowing launch")
+            return true
+        }
+        if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            close(descriptor)
+            QuickAskLog.shared.write("singleton lock already held")
+            return false
+        }
+        singletonLockFileDescriptor = descriptor
+        QuickAskLog.shared.write("singleton lock acquired")
+        return true
+    }
+
     private func currentScreen() -> NSScreen? {
         let location = NSEvent.mouseLocation
         return NSScreen.screens.first(where: { NSMouseInRect(location, $0.frame, false) }) ?? NSScreen.main
@@ -1524,6 +2114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["python3", resolveBackendPath(), "load", "--session-id", sessionID]
+        process.environment = settings.processEnvironment()
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -1575,6 +2166,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         uiTestHarness?.writeState()
     }
 
+    @objc
+    private func handleFrontmostApplicationChanged(_ notification: Notification) {
+        if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+            frontmostAppName = app.localizedName ?? ""
+        } else {
+            frontmostAppName = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+        }
+        uiTestHarness?.writeState()
+    }
+
     fileprivate func uiTestState(handledCommandID: Int) -> QuickAskUITestState {
         let selectedModel: String
         if let viewModel {
@@ -1586,6 +2187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         return QuickAskUITestState(
             panelVisible: panel?.isVisible ?? false,
             historyWindowVisible: historyWindow?.isVisible ?? false,
+            panelIsKeyWindow: panel?.isKeyWindow ?? false,
             panelFrame: CodableRect(panel?.frame ?? .zero),
             inputBarFrame: CodableRect(viewModel?.inputBarFrame ?? .zero),
             inputBarBottomInset: max(
@@ -1596,7 +2198,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             messageCount: viewModel?.messages.count ?? 0,
             queuedCount: viewModel?.queuedPrompts.count ?? 0,
             isGenerating: viewModel?.isGenerating ?? false,
+            focusRequestCount: viewModel?.focusRequestCount ?? 0,
+            frontmostAppName: frontmostAppName,
             selectedModel: selectedModel,
+            inputText: viewModel?.inputText ?? "",
             handledCommandID: handledCommandID
         )
     }
@@ -1607,6 +2212,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             showPanel()
         case "hide_panel":
             if panel.isVisible {
+                if historyWindow.isVisible {
+                    hideHistoryWindow()
+                }
                 viewModel.panelHidden()
                 panel.orderOut(nil)
             }
@@ -1620,12 +2228,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             viewModel.completeTestGeneration(with: command.text ?? "")
         case "new_chat":
             startNewChat()
+        case "clear_queue":
+            viewModel.clearQueuedPrompts()
+        case "request_focus":
+            viewModel.requestFocus()
         case "shortcut":
             switch command.shortcut {
             case "cmd_n":
                 startNewChat()
             case "cmd_enter":
-                viewModel.steerQueuedPrompt()
+                viewModel.steerCurrentInput()
             case "cmd_shift_backslash":
                 toggleHistoryWindow()
             case "cmd_backslash":
@@ -1640,9 +2252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 }
 
-final class MovableHostingView<Content: View>: NSHostingView<Content> {
-    override var mouseDownCanMoveWindow: Bool { true }
-}
+final class MovableHostingView<Content: View>: NSHostingView<Content> {}
 
 @main
 struct QuickAskApp: App {

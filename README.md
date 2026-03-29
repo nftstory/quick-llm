@@ -4,6 +4,8 @@ Quick Ask is a compact macOS chat panel for short prompts.
 
 It lives above your other windows, keeps the input bar pinned while the conversation grows upward, supports Claude CLI login plus local Ollama models, and saves transcripts automatically with encrypted-at-rest storage.
 
+![Quick Ask screenshot](assets/quick-ask-sample.png)
+
 ## What It Does
 
 - Toggle a floating panel with `Cmd+\`
@@ -12,6 +14,7 @@ It lives above your other windows, keeps the input bar pinned while the conversa
 - Queue prompts while a reply is still streaming
 - Steer to the next queued prompt with `Cmd+Enter`
 - Restore earlier chats from encrypted saved history
+- Pick a custom archive folder from `Settings…` in the model menu
 - Switch between Claude CLI-backed models and installed Ollama models
 
 ## Requirements
@@ -31,6 +34,7 @@ Transcript saves are encrypted before they are written to disk.
 - If Dropbox is not available, Quick Ask falls back to `~/Library/Application Support/Quick Ask/sessions`.
 - The encryption key is stored in macOS Keychain under the service name `local-chat-transcript-key`.
 - You can override the transcript folder with `QUICK_ASK_SAVE_DIR`.
+- You can also choose a custom archive folder in the app from the model menu `Settings…` screen.
 
 ## Build
 
@@ -53,7 +57,8 @@ That script:
 2. Press `Cmd+\` to show or hide the panel.
 3. Type a prompt and press `Enter`.
 4. Use the model menu to switch providers.
-5. Press `Cmd+Shift+\` to browse and restore prior chats.
+5. Open `Settings…` from the model menu if you want to change where encrypted archives are stored.
+6. Press `Cmd+Shift+\` to browse and restore prior chats.
 
 ## Development
 
