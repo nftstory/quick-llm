@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import shlex
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -64,6 +65,39 @@ CLAUDE_MODELS: list[dict[str, Any]] = [
     },
 ]
 
+CODEX_MODELS: list[dict[str, Any]] = [
+    {
+        "id": "codex::gpt-5.4",
+        "provider": "codex",
+        "model": "gpt-5.4",
+        "label": "ChatGPT 5.4",
+        "short_label": "ChatGPT 5.4",
+        "hint": None,
+        "default": False,
+    },
+    {
+        "id": "codex::gpt-5.4-mini",
+        "provider": "codex",
+        "model": "gpt-5.4-mini",
+        "label": "ChatGPT 5.4 Mini",
+        "short_label": "ChatGPT 5.4 Mini",
+        "hint": None,
+        "default": False,
+    },
+]
+
+GEMINI_MODELS: list[dict[str, Any]] = [
+    {
+        "id": "gemini::gemini-3-flash-preview",
+        "provider": "gemini",
+        "model": "gemini-3-flash-preview",
+        "label": "Gemini 3 Flash",
+        "short_label": "Gemini 3 Flash",
+        "hint": None,
+        "default": False,
+    },
+]
+
 FRIENDLY_OLLAMA_NAMES = {
     "eva-qwen2.5:14b-q8": "EVA Q8",
     "type32/eva-qwen-2.5-14b:latest": "EVA 14B",
@@ -86,6 +120,7 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("models", help="List available models for the panel.")
+    subparsers.add_parser("providers", help="List provider availability and login status.")
 
     history_parser = subparsers.add_parser("history", help="List encrypted Quick Ask sessions.")
     history_parser.add_argument("--limit", type=int, default=100, help="Maximum number of sessions to return.")
@@ -108,7 +143,20 @@ def friendly_ollama_name(model: str) -> str:
 
 
 def list_available_models() -> list[dict[str, Any]]:
-    models = [dict(model) for model in CLAUDE_MODELS]
+    statuses = provider_statuses()
+    enabled_providers = {
+        status["id"]
+        for status in statuses
+        if status.get("available") and status.get("logged_in")
+    }
+
+    models: list[dict[str, Any]] = []
+    if "claude" in enabled_providers:
+        models.extend(dict(model) for model in CLAUDE_MODELS)
+    if "codex" in enabled_providers:
+        models.extend(dict(model) for model in CODEX_MODELS)
+    if "gemini" in enabled_providers:
+        models.extend(dict(model) for model in GEMINI_MODELS)
     try:
         endpoint = shared.resolve_ollama_endpoint(ensure_local=True, prefer_env=False)
         records = shared.list_model_records(endpoint["base_url"])
@@ -135,6 +183,190 @@ def list_available_models() -> list[dict[str, Any]]:
     return models
 
 
+def command_path(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def run_subprocess(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float = 15.0,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=timeout,
+    )
+
+
+def last_json_line(text: str) -> dict[str, Any] | None:
+    for raw_line in reversed(text.splitlines()):
+        line = raw_line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def provider_statuses() -> list[dict[str, Any]]:
+    return [
+        claude_provider_status(),
+        codex_provider_status(),
+        gemini_provider_status(),
+        ollama_provider_status(),
+    ]
+
+
+def claude_provider_status() -> dict[str, Any]:
+    claude = command_path("claude") or str(pathlib.Path.home() / ".local/bin/claude")
+    if not pathlib.Path(claude).exists():
+        return {
+            "id": "claude",
+            "label": "Claude",
+            "available": False,
+            "logged_in": False,
+            "detail": "Claude CLI is not installed.",
+            "setup_command": "claude auth login --claudeai",
+        }
+
+    try:
+        result = run_subprocess(
+            [claude, "auth", "status", "--json"],
+            env=subscription_only_env(),
+            timeout=10.0,
+        )
+    except Exception as exc:
+        return {
+            "id": "claude",
+            "label": "Claude",
+            "available": True,
+            "logged_in": False,
+            "detail": f"Could not read Claude login status: {exc}",
+            "setup_command": "claude auth login --claudeai",
+        }
+
+    payload = last_json_line(result.stdout)
+    logged_in = bool(payload and payload.get("loggedIn"))
+    detail = "Ready via Claude CLI login." if logged_in else "Claude CLI is installed but not logged in."
+    return {
+        "id": "claude",
+        "label": "Claude",
+        "available": True,
+        "logged_in": logged_in,
+        "detail": detail,
+        "setup_command": "claude auth login --claudeai",
+    }
+
+
+def codex_provider_status() -> dict[str, Any]:
+    codex = command_path("codex")
+    if not codex:
+        return {
+            "id": "codex",
+            "label": "ChatGPT",
+            "available": False,
+            "logged_in": False,
+            "detail": "Codex CLI is not installed.",
+            "setup_command": "codex login --device-auth",
+        }
+
+    try:
+        result = run_subprocess([codex, "login", "status"], env=subscription_only_env(), timeout=10.0)
+    except Exception as exc:
+        return {
+            "id": "codex",
+            "label": "ChatGPT",
+            "available": True,
+            "logged_in": False,
+            "detail": f"Could not read Codex login status: {exc}",
+            "setup_command": "codex login --device-auth",
+        }
+
+    combined = "\n".join(part for part in [result.stdout, result.stderr] if part).lower()
+    logged_in = result.returncode == 0 and "logged in" in combined
+    detail = "Ready via Codex CLI login." if logged_in else "Codex CLI is installed but not logged in."
+    return {
+        "id": "codex",
+        "label": "ChatGPT",
+        "available": True,
+        "logged_in": logged_in,
+        "detail": detail,
+        "setup_command": "codex login --device-auth",
+    }
+
+
+def gemini_credentials_path() -> pathlib.Path:
+    return pathlib.Path.home() / ".gemini" / "oauth_creds.json"
+
+
+def gemini_provider_status() -> dict[str, Any]:
+    gemini = command_path("gemini")
+    if not gemini:
+        return {
+            "id": "gemini",
+            "label": "Gemini",
+            "available": False,
+            "logged_in": False,
+            "detail": "Gemini CLI is not installed.",
+            "setup_command": "gemini",
+        }
+
+    creds_path = gemini_credentials_path()
+    logged_in = creds_path.exists() and creds_path.stat().st_size > 0
+    detail = (
+        "Ready via Gemini CLI cached credentials."
+        if logged_in
+        else "Gemini CLI is installed but no cached CLI login was detected."
+    )
+    return {
+        "id": "gemini",
+        "label": "Gemini",
+        "available": True,
+        "logged_in": logged_in,
+        "detail": detail,
+        "setup_command": "gemini",
+    }
+
+
+def ollama_provider_status() -> dict[str, Any]:
+    ollama = command_path("ollama")
+    if not ollama:
+        return {
+            "id": "ollama",
+            "label": "Local",
+            "available": False,
+            "logged_in": False,
+            "detail": "Ollama is not installed.",
+            "setup_command": None,
+        }
+
+    try:
+        endpoint = shared.resolve_ollama_endpoint(ensure_local=True, prefer_env=False)
+        available = shared.endpoint_is_available(endpoint["base_url"])
+        detail = endpoint.get("label", endpoint["base_url"]) if available else "Ollama is installed but unavailable."
+    except Exception as exc:
+        available = False
+        detail = f"Ollama is installed but unavailable: {exc}"
+
+    return {
+        "id": "ollama",
+        "label": "Local",
+        "available": available,
+        "logged_in": available,
+        "detail": detail,
+        "setup_command": None,
+    }
+
+
 def build_prompt(history: list[dict[str, str]]) -> str:
     if not history:
         return "The user has not said anything yet."
@@ -155,11 +387,22 @@ def build_prompt(history: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def build_remote_cli_prompt(history: list[dict[str, str]]) -> str:
+    return (
+        f"System:\n{QUICK_SYSTEM_PROMPT}\n\n"
+        f"{build_prompt(history)}"
+    )
+
+
 def compact_preview(text: str, limit: int = 140) -> str:
     normalized = " ".join(text.split())
     if len(normalized) <= limit:
         return normalized
     return normalized[: max(0, limit - 1)].rstrip() + "…"
+
+
+def history_disabled() -> bool:
+    return os.environ.get("QUICK_ASK_DISABLE_HISTORY", "").strip() == "1"
 
 
 def session_preview(messages: list[dict[str, str]]) -> str:
@@ -182,7 +425,7 @@ def subscription_only_env() -> dict[str, str]:
 
 def claude_shell_invocation(model: str, history: list[dict[str, str]]) -> tuple[list[str], pathlib.Path]:
     prompt = build_prompt(history)
-    claude_path = pathlib.Path.home() / ".local/bin/claude"
+    claude_path = pathlib.Path(command_path("claude") or pathlib.Path.home() / ".local/bin/claude")
     SAFE_CWD.mkdir(parents=True, exist_ok=True)
     argv = [
         str(claude_path),
@@ -272,6 +515,158 @@ def stream_claude(model: str, history: list[dict[str, str]]) -> int:
     if proc.returncode != 0:
         emit({"type": "error", "message": stderr or f"Claude exited with status {proc.returncode}."})
         return proc.returncode
+    emit({"type": "done"})
+    return 0
+
+
+def codex_shell_invocation(model: str, history: list[dict[str, str]]) -> tuple[list[str], pathlib.Path]:
+    prompt = build_remote_cli_prompt(history)
+    codex_path = command_path("codex")
+    if not codex_path:
+        raise RuntimeError("Codex CLI is not installed.")
+    SAFE_CWD.mkdir(parents=True, exist_ok=True)
+    argv = [
+        codex_path,
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "-C",
+        str(SAFE_CWD),
+        "-s",
+        "read-only",
+        "-m",
+        model,
+        prompt,
+    ]
+    return argv, SAFE_CWD
+
+
+def stream_codex(model: str, history: list[dict[str, str]]) -> int:
+    command, safe_cwd = codex_shell_invocation(model, history)
+    proc = subprocess.Popen(
+        command,
+        cwd=str(safe_cwd),
+        env=subscription_only_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+
+    assert proc.stdout is not None
+    streamed_any = False
+    try:
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            item = payload.get("item") if payload.get("type") == "item.completed" else None
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = str(item.get("text") or "")
+                if text:
+                    emit({"type": "chunk", "text": text})
+                    streamed_any = True
+                continue
+
+            if payload.get("type") == "turn.completed":
+                emit({"type": "done"})
+                return 0
+    except KeyboardInterrupt:
+        proc.kill()
+        raise
+
+    stderr = ""
+    if proc.stderr is not None:
+        stderr = proc.stderr.read().strip()
+    proc.wait()
+    if proc.returncode != 0:
+        emit({"type": "error", "message": stderr or f"Codex exited with status {proc.returncode}."})
+        return proc.returncode
+    if not streamed_any:
+        emit({"type": "error", "message": "Codex did not return a reply."})
+        return 1
+    emit({"type": "done"})
+    return 0
+
+
+def gemini_shell_invocation(model: str, history: list[dict[str, str]]) -> tuple[list[str], pathlib.Path]:
+    prompt = build_remote_cli_prompt(history)
+    gemini_path = command_path("gemini")
+    if not gemini_path:
+        raise RuntimeError("Gemini CLI is not installed.")
+    SAFE_CWD.mkdir(parents=True, exist_ok=True)
+    argv = [
+        gemini_path,
+        "-p",
+        prompt,
+        "--output-format",
+        "stream-json",
+        "--approval-mode",
+        "plan",
+    ]
+    if model:
+        argv.extend(["--model", model])
+    return argv, SAFE_CWD
+
+
+def stream_gemini(model: str, history: list[dict[str, str]]) -> int:
+    command, safe_cwd = gemini_shell_invocation(model, history)
+    proc = subprocess.Popen(
+        command,
+        cwd=str(safe_cwd),
+        env=subscription_only_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+
+    assert proc.stdout is not None
+    streamed_any = False
+    try:
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if payload.get("type") == "message" and payload.get("role") == "assistant":
+                text = str(payload.get("content") or "")
+                if text:
+                    emit({"type": "chunk", "text": text})
+                    streamed_any = True
+                continue
+
+            if payload.get("type") == "result":
+                if payload.get("status") != "success":
+                    emit({"type": "error", "message": "Gemini request failed."})
+                    return 1
+                emit({"type": "done"})
+                return 0
+    except KeyboardInterrupt:
+        proc.kill()
+        raise
+
+    stderr = ""
+    if proc.stderr is not None:
+        stderr = proc.stderr.read().strip()
+    proc.wait()
+    if proc.returncode != 0:
+        emit({"type": "error", "message": stderr or f"Gemini exited with status {proc.returncode}."})
+        return proc.returncode
+    if not streamed_any:
+        emit({"type": "error", "message": "Gemini did not return a reply."})
+        return 1
     emit({"type": "done"})
     return 0
 
@@ -387,7 +782,15 @@ def handle_models() -> int:
     return 0
 
 
+def handle_providers() -> int:
+    emit({"type": "providers", "providers": provider_statuses()})
+    return 0
+
+
 def handle_history(limit: int) -> int:
+    if history_disabled():
+        emit({"type": "history", "sessions": []})
+        return 0
     base_dir = shared.default_save_dir()
     sessions: list[dict[str, Any]] = []
     for path in sorted(base_dir.glob("*.enc.json"), reverse=True):
@@ -431,6 +834,9 @@ def handle_history(limit: int) -> int:
 
 
 def handle_load(session_id: str) -> int:
+    if history_disabled():
+        emit({"type": "error", "message": "History is disabled."})
+        return 1
     base_dir = shared.default_save_dir()
     path = shared.resolve_session_path(base_dir, session_id)
     payload = shared.load_payload_from_path(path)
@@ -447,6 +853,10 @@ def handle_chat(model_id: str) -> int:
     provider, model = model_id.split("::", 1)
     if provider == "claude":
         return stream_claude(model, history)
+    if provider == "codex":
+        return stream_codex(model, history)
+    if provider == "gemini":
+        return stream_gemini(model, history)
     if provider == "ollama":
         return stream_ollama(model, history)
 
@@ -461,6 +871,16 @@ def transcript_model_label(model_id: str) -> str:
             if option["id"] == model_id:
                 return str(option["label"])
         return model
+    if provider == "codex":
+        for option in CODEX_MODELS:
+            if option["id"] == model_id:
+                return str(option["label"])
+        return model
+    if provider == "gemini":
+        for option in GEMINI_MODELS:
+            if option["id"] == model_id:
+                return str(option["label"])
+        return model
     return friendly_ollama_name(model)
 
 
@@ -471,6 +891,18 @@ def transcript_endpoint(model_id: str) -> dict[str, str]:
             "kind": "remote",
             "label": "claude-cli-login",
             "base_url": "claude://login",
+        }
+    if provider == "codex":
+        return {
+            "kind": "remote",
+            "label": "codex-cli-login",
+            "base_url": "codex://login",
+        }
+    if provider == "gemini":
+        return {
+            "kind": "remote",
+            "label": "gemini-cli-login",
+            "base_url": "gemini://login",
         }
 
     try:
@@ -485,6 +917,9 @@ def transcript_endpoint(model_id: str) -> dict[str, str]:
 
 
 def handle_save(session_id: str, created_at: str, model_id: str) -> int:
+    if history_disabled():
+        emit({"type": "saved", "path": ""})
+        return 0
     history = read_history_from_stdin()
     messages = [{"role": "system", "content": QUICK_SYSTEM_PROMPT}, *history]
     payload = {
@@ -507,6 +942,8 @@ def main() -> int:
     args = parse_args()
     if args.command == "models":
         return handle_models()
+    if args.command == "providers":
+        return handle_providers()
     if args.command == "history":
         return handle_history(args.limit)
     if args.command == "load":

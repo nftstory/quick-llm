@@ -142,6 +142,31 @@ struct QuickAskLoadedEnvelope: Codable {
     let session: QuickAskLoadedSession
 }
 
+struct QuickAskProviderStatus: Codable, Identifiable, Equatable {
+    let id: String
+    let label: String
+    let available: Bool
+    let loggedIn: Bool
+    let detail: String
+    let setupCommand: String?
+
+    var isReady: Bool { available && loggedIn }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case label
+        case available
+        case loggedIn = "logged_in"
+        case detail
+        case setupCommand = "setup_command"
+    }
+}
+
+private struct QuickAskProvidersEnvelope: Codable {
+    let type: String
+    let providers: [QuickAskProviderStatus]
+}
+
 private struct HistoryHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
 
@@ -171,16 +196,39 @@ private enum QuickAskTheme {
     static let panelAccent = Color.white.opacity(0.18)
 }
 
+private func quickAskUserDefaults() -> UserDefaults {
+    let environment = ProcessInfo.processInfo.environment
+    if let suiteName = environment["QUICK_ASK_USER_DEFAULTS_SUITE"],
+       !suiteName.isEmpty,
+       let defaults = UserDefaults(suiteName: suiteName) {
+        return defaults
+    }
+    return .standard
+}
+
 @MainActor
 final class QuickAskAppSettings: ObservableObject {
+    @Published var historyEnabled: Bool
     @Published private(set) var customArchiveDirectoryPath: String
+    @Published private(set) var setupCompleted: Bool
+    @Published private(set) var providerStatuses: [QuickAskProviderStatus] = []
+    @Published private(set) var isRefreshingProviders = false
+    @Published private(set) var providerStatusMessage = ""
 
     private let defaults: UserDefaults
     private let archiveDirectoryKey = "QuickAskCustomArchiveDirectory"
+    private let historyEnabledKey = "QuickAskHistoryEnabled"
+    private let setupCompletedKey = "QuickAskSetupCompleted"
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = quickAskUserDefaults()) {
         self.defaults = defaults
+        if defaults.object(forKey: historyEnabledKey) != nil {
+            self.historyEnabled = defaults.bool(forKey: historyEnabledKey)
+        } else {
+            self.historyEnabled = true
+        }
         self.customArchiveDirectoryPath = defaults.string(forKey: archiveDirectoryKey) ?? ""
+        self.setupCompleted = defaults.bool(forKey: setupCompletedKey)
     }
 
     var customArchiveDirectory: URL? {
@@ -189,43 +237,49 @@ final class QuickAskAppSettings: ObservableObject {
         return URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath).standardizedFileURL
     }
 
-    var usesAutomaticArchiveDirectory: Bool {
-        customArchiveDirectory == nil
+    var requiresArchiveFolderChoice: Bool {
+        historyEnabled
     }
 
-    var resolvedArchiveDirectory: URL {
-        if let customArchiveDirectory {
-            return customArchiveDirectory
-        }
+    var canContinuePastSetup: Bool {
+        !historyEnabled || customArchiveDirectory != nil
+    }
 
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let dropboxCandidates = [
-            home.appendingPathComponent("Library/CloudStorage/Dropbox", isDirectory: true),
-            home.appendingPathComponent("Dropbox", isDirectory: true),
-        ]
-        for base in dropboxCandidates where FileManager.default.fileExists(atPath: base.path) {
-            return base.appendingPathComponent("local-llm-chat/sessions", isDirectory: true)
-        }
-
-        return home.appendingPathComponent("Library/Application Support/Quick Ask/sessions", isDirectory: true)
+    var requiresInitialSetup: Bool {
+        !setupCompleted || !canContinuePastSetup
     }
 
     var archiveDirectorySummary: String {
-        usesAutomaticArchiveDirectory ? "Automatic" : "Custom"
+        if !historyEnabled {
+            return "Disabled"
+        }
+        return customArchiveDirectory == nil ? "Not chosen" : "Chosen"
     }
 
     var archiveDirectoryDetail: String {
-        resolvedArchiveDirectory.path
+        if !historyEnabled {
+            return "History is off."
+        }
+        return customArchiveDirectory?.path ?? "Choose an archive folder to continue."
     }
 
     func processEnvironment() -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
-        if let customArchiveDirectory {
+        if !historyEnabled || customArchiveDirectory == nil {
+            environment["QUICK_ASK_DISABLE_HISTORY"] = "1"
+            environment.removeValue(forKey: "QUICK_ASK_SAVE_DIR")
+        } else if let customArchiveDirectory {
             environment["QUICK_ASK_SAVE_DIR"] = customArchiveDirectory.path
+            environment.removeValue(forKey: "QUICK_ASK_DISABLE_HISTORY")
         } else {
             environment.removeValue(forKey: "QUICK_ASK_SAVE_DIR")
         }
         return environment
+    }
+
+    func setHistoryEnabled(_ enabled: Bool) {
+        historyEnabled = enabled
+        defaults.set(enabled, forKey: historyEnabledKey)
     }
 
     func setCustomArchiveDirectory(_ url: URL) {
@@ -238,6 +292,58 @@ final class QuickAskAppSettings: ObservableObject {
     func clearCustomArchiveDirectory() {
         customArchiveDirectoryPath = ""
         defaults.removeObject(forKey: archiveDirectoryKey)
+    }
+
+    func markSetupCompleted() {
+        setupCompleted = true
+        defaults.set(true, forKey: setupCompletedKey)
+    }
+
+    func refreshProviderStatuses(backendPath: String) {
+        guard !isRefreshingProviders else { return }
+        isRefreshingProviders = true
+        providerStatusMessage = ""
+        let processEnvironment = processEnvironment()
+
+        Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["python3", backendPath, "providers"]
+            process.environment = processEnvironment
+
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
+                let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
+                if let payload = try? JSONDecoder().decode(QuickAskProvidersEnvelope.self, from: stdoutData),
+                   payload.type == "providers" {
+                    await MainActor.run {
+                        self.providerStatuses = payload.providers
+                        self.providerStatusMessage = ""
+                        self.isRefreshingProviders = false
+                    }
+                    return
+                }
+
+                let message = String(data: stderrData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                await MainActor.run {
+                    self.providerStatusMessage = message?.isEmpty == false ? (message ?? "Could not check CLI logins.") : "Could not check CLI logins."
+                    self.isRefreshingProviders = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.providerStatusMessage = "Could not check CLI logins."
+                    self.isRefreshingProviders = false
+                }
+            }
+        }
     }
 }
 
@@ -258,6 +364,7 @@ private struct CodableRect: Codable {
 private struct QuickAskUITestState: Codable {
     let panelVisible: Bool
     let historyWindowVisible: Bool
+    let settingsWindowVisible: Bool
     let panelIsKeyWindow: Bool
     let panelFrame: CodableRect
     let inputBarFrame: CodableRect
@@ -270,6 +377,8 @@ private struct QuickAskUITestState: Codable {
     let frontmostAppName: String
     let selectedModel: String
     let inputText: String
+    let setupRequired: Bool
+    let historyEnabled: Bool
     let handledCommandID: Int
 }
 
@@ -303,7 +412,7 @@ final class QuickAskViewModel: ObservableObject {
 
     private let backendPath: String
     private let processEnvironmentProvider: () -> [String: String]
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private let lastModelKey = "QuickAskSelectedModelID"
     private let idleTimeout: TimeInterval = 45
     private let uiTestMode = ProcessInfo.processInfo.environment["QUICK_ASK_UI_TEST_MODE"] == "1"
@@ -320,9 +429,14 @@ final class QuickAskViewModel: ObservableObject {
     private var pendingResetPreserveInput = false
     private var pendingSteerAfterTermination = false
 
-    init(backendPath: String, processEnvironmentProvider: @escaping () -> [String: String]) {
+    init(
+        backendPath: String,
+        processEnvironmentProvider: @escaping () -> [String: String],
+        defaults: UserDefaults = quickAskUserDefaults()
+    ) {
         self.backendPath = backendPath
         self.processEnvironmentProvider = processEnvironmentProvider
+        self.defaults = defaults
         if let storedModel = defaults.string(forKey: lastModelKey), !storedModel.isEmpty {
             selectedModelID = storedModel
         }
@@ -1058,7 +1172,10 @@ struct QuickAskHistoryView: View {
 struct QuickAskSettingsView: View {
     @ObservedObject var settings: QuickAskAppSettings
     let onChooseArchiveDirectory: () -> Void
-    let onUseAutomaticArchiveDirectory: () -> Void
+    let onClearArchiveDirectory: () -> Void
+    let onRefreshProviders: () -> Void
+    let onLaunchProviderSetup: (String) -> Void
+    let onContinue: () -> Void
     let onClose: () -> Void
 
     private func commandButton(_ title: String, action: @escaping () -> Void) -> some View {
@@ -1073,16 +1190,24 @@ struct QuickAskSettingsView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Quick Ask Settings")
+                    Text(settings.requiresInitialSetup ? "Quick Ask Setup" : "Quick Ask Settings")
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(QuickAskTheme.strongText)
-                    Text("Choose where encrypted transcripts are stored.")
+                    Text("Reuse CLI logins only. No API keys.")
                         .font(.system(size: 11))
                         .foregroundStyle(QuickAskTheme.mutedText)
                 }
                 Spacer()
-                commandButton("Close") {
-                    onClose()
+                if settings.requiresInitialSetup {
+                    commandButton("Continue") {
+                        onContinue()
+                    }
+                    .disabled(!settings.canContinuePastSetup)
+                    .opacity(settings.canContinuePastSetup ? 1 : 0.42)
+                } else {
+                    commandButton("Close") {
+                        onClose()
+                    }
                 }
             }
             .padding(.horizontal, 14)
@@ -1095,35 +1220,123 @@ struct QuickAskSettingsView: View {
 
             VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Archive Folder")
+                    Text("History")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(QuickAskTheme.strongText)
-                    Text("\(settings.archiveDirectorySummary): \(settings.archiveDirectoryDetail)")
-                        .font(.system(size: 12, weight: .regular))
+                    Toggle(
+                        isOn: Binding(
+                            get: { settings.historyEnabled },
+                            set: { settings.setHistoryEnabled($0) }
+                        )
+                    ) {
+                        Text("Save encrypted history")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(QuickAskTheme.strongText)
+                    }
+                    .toggleStyle(.checkbox)
+
+                    Text(settings.historyEnabled ? "Pick a folder for encrypted archives before using Quick Ask." : "History is off. Quick Ask will not save transcripts.")
+                        .font(.system(size: 11, weight: .regular))
                         .foregroundStyle(QuickAskTheme.mutedText)
-                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if settings.historyEnabled {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Archive Folder")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(QuickAskTheme.strongText)
+                        Text(settings.archiveDirectoryDetail)
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundStyle(QuickAskTheme.mutedText)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        HStack(spacing: 8) {
+                            commandButton("Choose Folder…") {
+                                onChooseArchiveDirectory()
+                            }
+                            if settings.customArchiveDirectory != nil {
+                                commandButton("Clear") {
+                                    onClearArchiveDirectory()
+                                }
+                            }
+                        }
+
+                        if settings.customArchiveDirectory == nil {
+                            Text("History can stay disabled, or you can choose any local or Dropbox-synced folder here.")
+                                .font(.system(size: 11, weight: .regular))
+                                .foregroundStyle(QuickAskTheme.mutedText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+
+                Rectangle()
+                    .fill(QuickAskTheme.dividerColor)
+                    .frame(height: 1)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("CLI Providers")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(QuickAskTheme.strongText)
+                            Text("Quick Ask reuses whatever Claude, Codex/ChatGPT, Gemini, and Ollama access already exists on this Mac.")
+                                .font(.system(size: 11))
+                                .foregroundStyle(QuickAskTheme.mutedText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer()
+                        commandButton(settings.isRefreshingProviders ? "Refreshing…" : "Refresh") {
+                            onRefreshProviders()
+                        }
+                        .disabled(settings.isRefreshingProviders)
+                        .opacity(settings.isRefreshingProviders ? 0.42 : 1)
+                    }
+
+                    if !settings.providerStatusMessage.isEmpty {
+                        Text(settings.providerStatusMessage)
+                            .font(.system(size: 11))
+                            .foregroundStyle(QuickAskTheme.mutedText)
+                    }
+
+                    ForEach(settings.providerStatuses) { provider in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(alignment: .center, spacing: 8) {
+                                Text(provider.label)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(QuickAskTheme.strongText)
+                                Text(provider.isReady ? "ready" : "needs setup")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(provider.isReady ? QuickAskTheme.strongText.opacity(0.82) : QuickAskTheme.mutedText)
+                                Spacer()
+                                if provider.setupCommand != nil {
+                                    commandButton(provider.isReady ? "Open CLI" : "Set Up…") {
+                                        onLaunchProviderSetup(provider.id)
+                                    }
+                                }
+                            }
+
+                            Text(provider.detail)
+                                .font(.system(size: 11, weight: .regular))
+                                .foregroundStyle(QuickAskTheme.mutedText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                HStack(spacing: 8) {
-                    commandButton("Choose Folder…") {
-                        onChooseArchiveDirectory()
-                    }
-                    commandButton("Use Automatic") {
-                        onUseAutomaticArchiveDirectory()
+                        if provider.id != settings.providerStatuses.last?.id {
+                            Rectangle()
+                                .fill(QuickAskTheme.dividerColor)
+                                .frame(height: 1)
+                        }
                     }
                 }
-
-                Text("Automatic uses Dropbox when available, otherwise it falls back to Quick Ask’s local app-support folder.")
-                    .font(.system(size: 11, weight: .regular))
-                    .foregroundStyle(QuickAskTheme.mutedText)
-                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(14)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(QuickAskTheme.historyBackground)
         }
-        .frame(minWidth: 520, minHeight: 190)
+        .frame(minWidth: 560, minHeight: 320)
         .background(QuickAskTheme.frameBackground)
     }
 }
@@ -1719,7 +1932,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     private var panelBottomY: CGFloat?
     private var isProgrammaticPanelMove = false
     private var uiTestHarness: QuickAskUITestHarness?
-    private let defaults = UserDefaults.standard
+    private var backendPath = ""
+    private let defaults = quickAskUserDefaults()
     private let panelOriginXKey = "QuickAskPanelOriginX"
     private let panelBottomYKey = "QuickAskPanelBottomY"
     private let uiTestMode = ProcessInfo.processInfo.environment["QUICK_ASK_UI_TEST_MODE"] == "1"
@@ -1746,13 +1960,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             }
         }
 
-        let backendPath = resolveBackendPath()
+        backendPath = resolveBackendPath()
         settings = QuickAskAppSettings(defaults: defaults)
         viewModel = QuickAskViewModel(
             backendPath: backendPath,
             processEnvironmentProvider: { [weak self] in
                 self?.settings.processEnvironment() ?? ProcessInfo.processInfo.environment
-            }
+            },
+            defaults: defaults
         )
         viewModel.layoutDelegate = self
         historyViewModel = QuickAskHistoryViewModel(
@@ -1790,8 +2005,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                 onChooseArchiveDirectory: { [weak self] in
                     self?.chooseArchiveDirectory()
                 },
-                onUseAutomaticArchiveDirectory: { [weak self] in
-                    self?.useAutomaticArchiveDirectory()
+                onClearArchiveDirectory: { [weak self] in
+                    self?.clearArchiveDirectory()
+                },
+                onRefreshProviders: { [weak self] in
+                    self?.refreshSettingsStatus()
+                },
+                onLaunchProviderSetup: { [weak self] providerID in
+                    self?.launchProviderSetup(for: providerID)
+                },
+                onContinue: { [weak self] in
+                    self?.completeInitialSetup()
                 },
                 onClose: { [weak self] in
                     self?.hideSettingsWindow()
@@ -1854,7 +2078,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         )
 
         settingsWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 220),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 360),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -1870,7 +2094,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         settingsWindow.contentView = settingsHostingView
         settingsWindow.setFrameAutosaveName("QuickAskSettingsWindowFrame")
         if !settingsWindow.setFrameUsingName("QuickAskSettingsWindowFrame") {
-            settingsWindow.setFrame(NSRect(x: 0, y: 0, width: 520, height: 220), display: false)
+            settingsWindow.setFrame(NSRect(x: 0, y: 0, width: 560, height: 360), display: false)
         }
         settingsWindow.orderOut(nil)
 
@@ -1901,6 +2125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         }
         viewModel.loadModels()
         historyViewModel.reload()
+        refreshSettingsStatus()
         quickAskNeedsLayout()
         uiTestHarness = QuickAskUITestHarness(appDelegate: self)
         uiTestHarness?.writeState()
@@ -1964,10 +2189,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         uiTestHarness?.writeState()
     }
 
-    private func showSettingsWindow() {
+    private func showSettingsWindow(activate: Bool = true) {
+        refreshSettingsStatus()
+        positionSettingsWindow()
         settingsWindow.makeKeyAndOrderFront(nil)
         settingsWindow.orderFrontRegardless()
-        NSApp.activate(ignoringOtherApps: true)
+        if activate {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         uiTestHarness?.writeState()
     }
 
@@ -1984,7 +2213,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         panel.canCreateDirectories = true
         panel.prompt = "Choose"
         panel.title = "Choose Archive Folder"
-        panel.directoryURL = settings.resolvedArchiveDirectory.deletingLastPathComponent()
+        panel.directoryURL = settings.customArchiveDirectory?.deletingLastPathComponent()
+            ?? FileManager.default.homeDirectoryForCurrentUser
         if panel.runModal() == .OK, let url = panel.url {
             settings.setCustomArchiveDirectory(url)
             viewModel.persistCurrentTranscript()
@@ -1992,10 +2222,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         }
     }
 
-    private func useAutomaticArchiveDirectory() {
+    private func clearArchiveDirectory() {
         settings.clearCustomArchiveDirectory()
         viewModel.persistCurrentTranscript()
         historyViewModel.reload()
+    }
+
+    private func refreshSettingsStatus() {
+        settings.refreshProviderStatuses(backendPath: backendPath)
+        viewModel.loadModels()
+        historyViewModel.reload()
+    }
+
+    private func completeInitialSetup() {
+        guard settings.canContinuePastSetup else {
+            showSettingsWindow()
+            return
+        }
+        let shouldRevealPanel = settings.requiresInitialSetup && !panel.isVisible
+        settings.markSetupCompleted()
+        refreshSettingsStatus()
+        hideSettingsWindow()
+        if shouldRevealPanel {
+            showPanel()
+        }
+    }
+
+    private func shouldGateOnSetup() -> Bool {
+        settings.requiresInitialSetup
+    }
+
+    private func launchProviderSetup(for providerID: String) {
+        let command: String
+        switch providerID {
+        case "claude":
+            command = "claude auth login --claudeai"
+        case "codex":
+            command = "codex login --device-auth"
+        case "gemini":
+            command = "gemini"
+        default:
+            return
+        }
+        openTerminal(command: command)
+    }
+
+    private func openTerminal(command: String) {
+        let escaped = command
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let script = """
+        tell application "Terminal"
+            activate
+            do script "\(escaped)"
+        end tell
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        do {
+            try process.run()
+        } catch {
+            QuickAskLog.shared.write("failed to launch Terminal for provider setup: \(error.localizedDescription)")
+        }
     }
 
     private func togglePanel() {
@@ -2013,6 +2302,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             return
         }
 
+        guard !shouldGateOnSetup() else {
+            showSettingsWindow()
+            return
+        }
+
         QuickAskLog.shared.write("togglePanel showing panel")
         quickAskNeedsLayout()
         panel.makeKeyAndOrderFront(nil)
@@ -2026,6 +2320,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
 
     private func showPanel() {
         QuickAskLog.shared.write("showPanel")
+        guard !shouldGateOnSetup() else {
+            showSettingsWindow()
+            return
+        }
         quickAskNeedsLayout()
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
@@ -2037,6 +2335,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 
     private func toggleHistoryWindow() {
+        guard !shouldGateOnSetup() else {
+            showSettingsWindow()
+            return
+        }
+        guard settings.historyEnabled else {
+            showSettingsWindow()
+            return
+        }
         if historyWindow.isVisible {
             QuickAskLog.shared.write("toggleHistoryWindow hiding history")
             hideHistoryWindow()
@@ -2108,6 +2414,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     private func currentScreen() -> NSScreen? {
         let location = NSEvent.mouseLocation
         return NSScreen.screens.first(where: { NSMouseInRect(location, $0.frame, false) }) ?? NSScreen.main
+    }
+
+    private func positionSettingsWindow() {
+        guard let screen = currentScreen() else {
+            settingsWindow.center()
+            return
+        }
+        let visible = screen.visibleFrame
+        let size = settingsWindow.frame.size
+        let origin = NSPoint(
+            x: round(visible.midX - (size.width / 2)),
+            y: round(visible.midY - (size.height / 2))
+        )
+        settingsWindow.setFrameOrigin(origin)
     }
 
     private func loadSession(_ sessionID: String) {
@@ -2187,6 +2507,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         return QuickAskUITestState(
             panelVisible: panel?.isVisible ?? false,
             historyWindowVisible: historyWindow?.isVisible ?? false,
+            settingsWindowVisible: settingsWindow?.isVisible ?? false,
             panelIsKeyWindow: panel?.isKeyWindow ?? false,
             panelFrame: CodableRect(panel?.frame ?? .zero),
             inputBarFrame: CodableRect(viewModel?.inputBarFrame ?? .zero),
@@ -2202,6 +2523,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             frontmostAppName: frontmostAppName,
             selectedModel: selectedModel,
             inputText: viewModel?.inputText ?? "",
+            setupRequired: settings?.requiresInitialSetup ?? false,
+            historyEnabled: settings?.historyEnabled ?? true,
             handledCommandID: handledCommandID
         )
     }
@@ -2222,12 +2545,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             viewModel.inputText = command.text ?? ""
             viewModel.touch()
             quickAskNeedsLayout()
+        case "show_settings":
+            showSettingsWindow()
         case "submit":
             viewModel.send()
         case "complete_generation":
             viewModel.completeTestGeneration(with: command.text ?? "")
         case "new_chat":
             startNewChat()
+        case "complete_setup":
+            completeInitialSetup()
+        case "set_history_enabled":
+            settings.setHistoryEnabled((command.text ?? "1") == "1")
+            historyViewModel.reload()
+        case "set_archive_dir":
+            if let text = command.text, !text.isEmpty {
+                settings.setCustomArchiveDirectory(URL(fileURLWithPath: text))
+                historyViewModel.reload()
+            }
+        case "clear_archive_dir":
+            clearArchiveDirectory()
         case "clear_queue":
             viewModel.clearQueuedPrompts()
         case "request_focus":
