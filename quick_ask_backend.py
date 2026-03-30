@@ -12,6 +12,7 @@ import os
 import pathlib
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 from typing import Any
@@ -123,6 +124,20 @@ FRIENDLY_OLLAMA_NAMES = {
 
 def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=True), flush=True)
+
+
+def internet_reachable(timeout: float = 1.0) -> bool:
+    targets = [
+        ("1.1.1.1", 443),
+        ("8.8.8.8", 53),
+    ]
+    for host, port in targets:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def parse_args() -> argparse.Namespace:
@@ -915,7 +930,13 @@ def read_history_from_stdin() -> list[dict[str, str]]:
 
 
 def handle_models() -> int:
-    emit({"type": "models", "models": list_available_models()})
+    emit(
+        {
+            "type": "models",
+            "models": list_available_models(),
+            "network_online": internet_reachable(),
+        }
+    )
     return 0
 
 

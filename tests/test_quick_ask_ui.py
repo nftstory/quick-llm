@@ -400,14 +400,19 @@ class QuickAskUITests(unittest.TestCase):
             self.assertIn("session-b", loaded["historySessionIDs"])
 
             deleted = app.command("delete_history_session", text="session-a")
+            self.assertIn("session-b", deleted["historySessionIDs"])
+            final_state = app.wait_for(
+                lambda state: "session-a" not in state["historySessionIDs"] and not first.exists(),
+                timeout=8.0,
+            )
             self.assertFalse(first.exists())
-            final_state = app.wait_for(lambda state: "session-a" not in state["historySessionIDs"], timeout=8.0)
             self.assertIn("session-b", final_state["historySessionIDs"])
             self.assertNotIn("session-a", final_state["historySessionIDs"])
 
     def test_setup_gate_blocks_panel_until_history_is_configured(self) -> None:
         with QuickAskHarness(initial_setup_complete=False, force_setup_gate=True) as app:
-            gated = app.command("show_panel")
+            app.command("show_panel")
+            gated = app.wait_for(lambda state: state["settingsWindowVisible"], timeout=8.0)
             self.assertFalse(gated["panelVisible"])
             self.assertTrue(gated["settingsWindowVisible"])
 
@@ -552,6 +557,44 @@ class QuickAskUITests(unittest.TestCase):
             self.assertTrue(in_flight["isGenerating"])
             self.assertEqual(in_flight["selectedModel"], "ChatGPT 5.4")
             self.assertEqual(in_flight["messageCount"], 4)
+
+    def test_offline_defaults_to_best_visible_ollama_model(self) -> None:
+        with QuickAskHarness(extra_env={"QUICK_ASK_UI_TEST_NETWORK_ONLINE": "0"}) as app:
+            shown = app.command("show_panel")
+            ready = app.wait_for(
+                lambda current: len(current["visibleModelIDs"]) > 0 and current["selectedModel"] == "Qwen 2.5 14B",
+                timeout=8.0,
+            )
+            self.assertEqual(ready["selectedModel"], "Qwen 2.5 14B")
+            self.assertIn("ollama::qwen2.5:14b", ready["visibleModelIDs"])
+            self.assertTrue(shown["panelVisible"])
+
+    def test_failed_turn_surfaces_retry_and_replays_prompt_without_duplication(self) -> None:
+        with QuickAskHarness() as app:
+            app.command("show_panel")
+            app.command("set_input", text="ebitda vs the other thing")
+            app.command("submit")
+
+            failed = app.command(
+                "fail_generation",
+                text='Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired. Please obtain a new token or refresh your existing token."}}',
+            )
+            self.assertFalse(failed["isGenerating"])
+            self.assertTrue(failed["retryAvailable"])
+            self.assertIn("could not authenticate", failed["statusText"].lower())
+            self.assertEqual(failed["messageCount"], 1)
+
+            app.command("select_model", text="ollama::qwen2.5:14b")
+            retried = app.command("retry_failed_turn")
+            self.assertTrue(retried["isGenerating"])
+            self.assertFalse(retried["retryAvailable"])
+            self.assertEqual(retried["selectedModel"], "Qwen 2.5 14B")
+            self.assertEqual(retried["messageCount"], 2)
+
+            completed = app.command("complete_generation", text="Here is the retry reply.")
+            self.assertFalse(completed["isGenerating"])
+            self.assertEqual(completed["messageCount"], 2)
+            self.assertEqual(completed["statusText"], "")
 
 
 if __name__ == "__main__":

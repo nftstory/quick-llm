@@ -83,6 +83,9 @@ struct ModelOption: Codable, Identifiable, Equatable {
 private struct ModelsEnvelope: Codable {
     let type: String
     let models: [ModelOption]
+    let network_online: Bool?
+
+    var networkOnline: Bool? { network_online }
 }
 
 struct QuickAskHistorySession: Codable, Identifiable, Equatable {
@@ -489,6 +492,8 @@ private struct QuickAskUITestState: Codable {
     let selectedModel: String
     let visibleModelIDs: [String]
     let inputText: String
+    let statusText: String
+    let retryAvailable: Bool
     let setupRequired: Bool
     let historyEnabled: Bool
     let screenVisibleHeight: Double
@@ -509,6 +514,11 @@ protocol QuickAskLayoutDelegate: AnyObject {
 
 @MainActor
 final class QuickAskViewModel: ObservableObject {
+    private struct FailedTurnRetryContext {
+        let prompt: String
+        let messagesBeforeTurn: [ChatMessage]
+    }
+
     @Published var messages: [ChatMessage] = []
     @Published var queuedPrompts: [QueuedPrompt] = []
     @Published var inputText = ""
@@ -544,6 +554,10 @@ final class QuickAskViewModel: ObservableObject {
     private var pendingResetPreserveInput = false
     private var pendingSteerPromptID: UUID?
     private var currentTurnStreamedAny = false
+    private var activePromptText: String?
+    private var messagesBeforeActiveTurn: [ChatMessage] = []
+    private var lastFailedTurn: FailedTurnRetryContext?
+    private var lastKnownNetworkOnline: Bool?
 
     init(
         backendPath: String,
@@ -607,7 +621,7 @@ final class QuickAskViewModel: ObservableObject {
 
     func loadModels() {
         if uiTestMode {
-            applyLoadedModels(uiTestModelOptions())
+            applyLoadedModels(uiTestModelOptions(), networkOnline: uiTestNetworkOnline())
             return
         }
 
@@ -645,18 +659,21 @@ final class QuickAskViewModel: ObservableObject {
             }
 
             await MainActor.run {
-                self.applyLoadedModels(payload.models)
+                self.applyLoadedModels(payload.models, networkOnline: payload.networkOnline)
             }
         }
     }
 
-    private func applyLoadedModels(_ loadedModels: [ModelOption]) {
+    private func applyLoadedModels(_ loadedModels: [ModelOption], networkOnline: Bool? = nil) {
         availableModelsObserver(loadedModels)
         let visibleModels = visibleModelsProvider(loadedModels)
         models = visibleModels
+        lastKnownNetworkOnline = networkOnline
 
         let preferredModelID = defaults.string(forKey: lastModelKey)
-        if let preferredModelID,
+        if let offlineFallbackModel = offlineFallbackModel(from: visibleModels, networkOnline: networkOnline) {
+            selectedModelID = offlineFallbackModel.id
+        } else if let preferredModelID,
            visibleModels.contains(where: { $0.id == preferredModelID }) {
             selectedModelID = preferredModelID
         } else if let selected = visibleModels.first(where: { $0.id == selectedModelID }) {
@@ -669,6 +686,15 @@ final class QuickAskViewModel: ObservableObject {
         } else if statusText == "Could not load models." || statusText == "No enabled models are available." {
             statusText = ""
         }
+    }
+
+    private func uiTestNetworkOnline() -> Bool {
+        ProcessInfo.processInfo.environment["QUICK_ASK_UI_TEST_NETWORK_ONLINE"] != "0"
+    }
+
+    private func offlineFallbackModel(from visibleModels: [ModelOption], networkOnline: Bool?) -> ModelOption? {
+        guard networkOnline == false else { return nil }
+        return visibleModels.first(where: { $0.provider == "ollama" })
     }
 
     private func uiTestModelOptions() -> [ModelOption] {
@@ -694,6 +720,7 @@ final class QuickAskViewModel: ObservableObject {
         messages = []
         queuedPrompts = []
         historyAreaHeight = 0
+        clearRetryContext()
         if !preserveInput {
             inputText = ""
         }
@@ -717,6 +744,7 @@ final class QuickAskViewModel: ObservableObject {
         stdoutBuffer = Data()
         stderrBuffer = Data()
         activeProcess = nil
+        clearRetryContext()
 
         let restoredMessages = session.messages.compactMap { message -> ChatMessage? in
             let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -833,6 +861,9 @@ final class QuickAskViewModel: ObservableObject {
     private func startGeneration(for prompt: String) {
         statusText = ""
         currentTurnStreamedAny = false
+        lastFailedTurn = nil
+        messagesBeforeActiveTurn = messages
+        activePromptText = prompt
         messages.append(ChatMessage(role: .user, content: prompt))
         let assistantID = UUID()
         activeAssistantMessageID = assistantID
@@ -918,6 +949,9 @@ final class QuickAskViewModel: ObservableObject {
             stderr.fileHandleForReading.readabilityHandler = nil
             activeProcess = nil
             isGenerating = false
+            lastFailedTurn = FailedTurnRetryContext(prompt: prompt, messagesBeforeTurn: messagesBeforeActiveTurn)
+            activePromptText = nil
+            messagesBeforeActiveTurn = []
             statusText = "Could not start backend."
             trimEmptyAssistantMessage()
             layoutDelegate?.quickAskNeedsLayout()
@@ -944,6 +978,13 @@ final class QuickAskViewModel: ObservableObject {
             appendAssistantChunk(text)
         }
         finishGeneration(exitCode: 0)
+    }
+
+    func failTestGeneration(with message: String) {
+        guard uiTestMode, isGenerating else { return }
+        stderrBuffer = Data(message.utf8)
+        statusText = ""
+        finishGeneration(exitCode: 1)
     }
 
     private func cancelActiveGeneration() {
@@ -1003,6 +1044,8 @@ final class QuickAskViewModel: ObservableObject {
 
     private func finishGeneration(exitCode: Int32) {
         let interruptedForSteer = pendingSteerPromptID != nil
+        let failedTurnPrompt = activePromptText
+        let messagesBeforeTurn = messagesBeforeActiveTurn
         isGenerating = false
         activeProcess = nil
 
@@ -1027,6 +1070,14 @@ final class QuickAskViewModel: ObservableObject {
             messages.remove(at: index)
         }
 
+        if exitCode != 0 && !interruptedForSteer, let failedTurnPrompt, !failedTurnPrompt.isEmpty {
+            lastFailedTurn = FailedTurnRetryContext(prompt: failedTurnPrompt, messagesBeforeTurn: messagesBeforeTurn)
+        } else if exitCode == 0 {
+            lastFailedTurn = nil
+        }
+
+        activePromptText = nil
+        messagesBeforeActiveTurn = []
         activeAssistantMessageID = nil
         saveTranscript()
         layoutDelegate?.quickAskNeedsLayout()
@@ -1035,7 +1086,7 @@ final class QuickAskViewModel: ObservableObject {
             sendQueuedPrompt(id: pendingSteerPromptID)
             return
         }
-        if !queuedPrompts.isEmpty {
+        if !queuedPrompts.isEmpty && statusText.isEmpty {
             sendNextQueuedPrompt()
             return
         }
@@ -1067,8 +1118,25 @@ final class QuickAskViewModel: ObservableObject {
         if lowercased.contains("env: node: no such file or directory") {
             return "\(modelLabel) could not start because the Gemini CLI could not find Node.js. Reopen Quick Ask or choose another model."
         }
+        if lowercased.contains("failed to authenticate")
+            || lowercased.contains("authentication_error")
+            || lowercased.contains("oauth token has expired")
+            || lowercased.contains("token has expired") {
+            return "\(modelLabel) could not authenticate. Refresh that CLI login in Settings or switch models, then Retry."
+        }
         if lowercased.contains("not logged in") || lowercased.contains("auth login") {
             return "\(modelLabel) is not available from this Mac right now. Open Settings and finish the CLI login for that provider."
+        }
+        if lowercased.contains("network is unreachable")
+            || lowercased.contains("could not resolve host")
+            || lowercased.contains("name or service not known")
+            || lowercased.contains("connection timed out")
+            || lowercased.contains("operation timed out")
+            || lowercased.contains("timed out") {
+            if lastKnownNetworkOnline == false {
+                return "\(modelLabel) could not reach its remote service. If you're offline, switch to an Ollama model or Retry after reconnecting."
+            }
+            return "\(modelLabel) could not reach its remote service. Retry in a moment or switch models."
         }
         if lowercased.contains("quota") || lowercased.contains("capacity") || lowercased.contains("rate limit") {
             return "\(modelLabel) is temporarily out of quota or rate-limited. Try again shortly or switch models."
@@ -1081,6 +1149,26 @@ final class QuickAskViewModel: ObservableObject {
         }
 
         return trimmed
+    }
+
+    var canRetryLastFailure: Bool {
+        !isGenerating && lastFailedTurn != nil && !statusText.isEmpty
+    }
+
+    func retryLastFailedTurn() {
+        guard !isGenerating, let lastFailedTurn else { return }
+        touch()
+        statusText = ""
+        activeAssistantMessageID = nil
+        messages = lastFailedTurn.messagesBeforeTurn
+        layoutDelegate?.quickAskNeedsLayout()
+        startGeneration(for: lastFailedTurn.prompt)
+    }
+
+    private func clearRetryContext() {
+        lastFailedTurn = nil
+        activePromptText = nil
+        messagesBeforeActiveTurn = []
     }
 
     private func trimEmptyAssistantMessage() {
@@ -2502,6 +2590,18 @@ struct QuickAskView: View {
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(QuickAskTheme.mutedText)
                         Spacer()
+                        if viewModel.canRetryLastFailure {
+                            Button("Retry") {
+                                viewModel.retryLastFailedTurn()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(QuickAskTheme.strongText)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(QuickAskTheme.frameBackground.opacity(0.92))
+                            .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
+                        }
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 7)
@@ -3380,6 +3480,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             selectedModel: selectedModel,
             visibleModelIDs: visibleModelIDs,
             inputText: viewModel?.inputText ?? "",
+            statusText: viewModel?.statusText ?? "",
+            retryAvailable: viewModel?.canRetryLastFailure ?? false,
             setupRequired: settings?.requiresInitialSetup ?? false,
             historyEnabled: settings?.historyEnabled ?? true,
             screenVisibleHeight: Double(screenVisibleHeight),
@@ -3411,6 +3513,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             viewModel.send()
         case "complete_generation":
             viewModel.completeTestGeneration(with: command.text ?? "")
+        case "fail_generation":
+            viewModel.failTestGeneration(with: command.text ?? "The reply failed.")
         case "new_chat":
             startNewChat()
         case "complete_setup":
@@ -3455,6 +3559,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             }
         case "refresh_models":
             viewModel.loadModels()
+        case "retry_failed_turn":
+            viewModel.retryLastFailedTurn()
         case "request_focus":
             viewModel.requestFocus()
         case "shortcut":

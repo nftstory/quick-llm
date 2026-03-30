@@ -31,6 +31,21 @@ class ProviderRuntimeEnvTests(unittest.TestCase):
                     self.assertIn("/opt/homebrew/bin", path_entries)
                     self.assertIn("/Users/test/.nvm/versions/node/v24/bin", path_entries)
 
+    def test_handle_models_reports_network_online_flag(self) -> None:
+        with mock.patch.object(backend, "list_available_models", return_value=[]):
+            with mock.patch.object(backend, "internet_reachable", return_value=False):
+                with mock.patch.object(backend, "emit") as emit:
+                    result = backend.handle_models()
+
+        self.assertEqual(result, 0)
+        emit.assert_called_once_with(
+            {
+                "type": "models",
+                "models": [],
+                "network_online": False,
+            }
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
