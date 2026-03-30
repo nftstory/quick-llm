@@ -10,7 +10,10 @@ The app lives above your other windows, keeps the input bar pinned while the con
 
 - Toggle a floating panel with `Cmd+\`
 - Open a separate history window with `Cmd+Shift+\`
+- Open history from the model menu without leaving the panel
+- Open a keyboard shortcuts reference from `Settings…`
 - Start a fresh chat with `Cmd+N`
+- Dismiss the focused Quick Ask window with `Cmd+W`
 - Queue prompts while a reply is still streaming
 - Steer to the next queued prompt with `Cmd+Enter`
 - Cancel queued prompts without interrupting the current reply
@@ -20,7 +23,7 @@ The app lives above your other windows, keeps the input bar pinned while the con
 - Show a small setup screen only when history is enabled but no archive folder has been chosen yet
 - Pick your own archive folder or disable history entirely
 - Switch between Claude via Claude CLI, ChatGPT via Codex CLI, Gemini via Gemini CLI, and installed Ollama models
-- Recheck Claude, Codex, Gemini, and local-model availability from `Settings…`
+- Recheck Claude, Codex, Gemini, and Ollama availability from `Settings…`
 - Hide or re-enable individual available models from `Settings…`
 
 ## Requirements
@@ -68,8 +71,10 @@ That script:
 4. Press `Cmd+\` to show or hide the panel.
 5. Type a prompt and press `Enter`.
 6. Use the model menu to switch providers or open `Settings…`.
+   You can also open `History` directly from that menu.
 7. Press `Cmd+Shift+\` to browse and restore prior chats when history is enabled.
-8. Press `Cmd+,` to open the real Quick Ask settings window.
+8. Press `Cmd+,` to toggle the real Quick Ask settings window.
+9. Use the `Keyboard Shortcuts` button in settings for a compact shortcut reference.
 
 If at least one provider or local model is already available, Quick Ask does not block you on provider setup. Provider status in `Settings…` is informational and reusable, not an API-key onboarding flow.
 

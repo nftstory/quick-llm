@@ -48,7 +48,7 @@ The app name is `Quick Ask`.
 - ChatGPT via Codex CLI login
 - Gemini via Gemini CLI login
 
-### Local providers
+### Ollama providers
 
 - Ollama models discovered from the local install
 
@@ -206,4 +206,4 @@ Latest verification snapshot:
 
 - `./build-quick-ask`
 - `python3 tests/test_quick_ask_ui.py -v`
-- 18 passing UI tests
+- 21 passing UI tests

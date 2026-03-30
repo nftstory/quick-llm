@@ -472,6 +472,7 @@ private struct QuickAskUITestState: Codable {
     let panelVisible: Bool
     let historyWindowVisible: Bool
     let settingsWindowVisible: Bool
+    let shortcutsWindowVisible: Bool
     let panelIsKeyWindow: Bool
     let panelFrame: CodableRect
     let settingsFrame: CodableRect
@@ -1324,8 +1325,8 @@ struct QuickAskHistoryRow: View {
                                     .foregroundStyle(QuickAskTheme.mutedText)
                                     .lineLimit(1)
                             }
-                            Text("\(session.messageCount)")
-                                .font(.system(size: 11, weight: .regular, design: .monospaced))
+                            Text("\(session.messageCount) \(session.messageCount == 1 ? "message" : "messages")")
+                                .font(.system(size: 11, weight: .regular))
                                 .foregroundStyle(QuickAskTheme.mutedText)
                                 .lineLimit(1)
                             Text(relativeSavedAtText)
@@ -1459,6 +1460,7 @@ struct QuickAskSettingsView: View {
     let onClearArchiveDirectory: () -> Void
     let onRefreshProviders: () -> Void
     let onLaunchProviderSetup: (String) -> Void
+    let onOpenShortcuts: () -> Void
     let onLayoutChange: () -> Void
     let onContinue: () -> Void
     let onClose: () -> Void
@@ -1494,6 +1496,9 @@ struct QuickAskSettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
+                commandButton("Keyboard Shortcuts") {
+                    onOpenShortcuts()
+                }
                 if settings.requiresInitialSetup {
                     commandButton("Continue") {
                         onContinue()
@@ -1703,6 +1708,82 @@ struct QuickAskSettingsView: View {
         .onChange(of: settings.availableModels) { _, _ in onLayoutChange() }
         .onChange(of: settings.keychainReady) { _, _ in onLayoutChange() }
         .onChange(of: settings.storageDetail) { _, _ in onLayoutChange() }
+    }
+}
+
+private struct KeyboardShortcutItem: Identifiable {
+    let id = UUID()
+    let keys: String
+    let description: String
+}
+
+private let quickAskKeyboardShortcuts: [KeyboardShortcutItem] = [
+    KeyboardShortcutItem(keys: "Cmd+\\", description: "Show or hide Quick Ask"),
+    KeyboardShortcutItem(keys: "Cmd+Shift+\\", description: "Open or close history"),
+    KeyboardShortcutItem(keys: "Cmd+,", description: "Open settings"),
+    KeyboardShortcutItem(keys: "Cmd+N", description: "Start a fresh chat"),
+    KeyboardShortcutItem(keys: "Enter", description: "Send the current prompt"),
+    KeyboardShortcutItem(keys: "Cmd+Enter", description: "Steer the current draft ahead of the queue"),
+]
+
+struct QuickAskKeyboardShortcutsView: View {
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Keyboard Shortcuts")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(QuickAskTheme.strongText)
+                    Text("Quick Ask hotkeys and panel controls")
+                        .font(.system(size: 11))
+                        .foregroundStyle(QuickAskTheme.mutedText)
+                }
+                Spacer()
+                Button("Close", action: onClose)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(QuickAskTheme.strongText)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Rectangle().fill(Color.white.opacity(0.16)))
+                    .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(QuickAskTheme.inputBackground)
+
+            Rectangle()
+                .fill(QuickAskTheme.dividerColor)
+                .frame(height: 1)
+
+            VStack(spacing: 0) {
+                ForEach(Array(quickAskKeyboardShortcuts.enumerated()), id: \.offset) { index, shortcut in
+                    HStack(alignment: .top, spacing: 12) {
+                        Text(shortcut.keys)
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(QuickAskTheme.strongText)
+                            .frame(width: 112, alignment: .leading)
+                        Text(shortcut.description)
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundStyle(QuickAskTheme.mutedText)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+
+                    if index != quickAskKeyboardShortcuts.count - 1 {
+                        Rectangle()
+                            .fill(QuickAskTheme.dividerColor)
+                            .frame(height: 1)
+                    }
+                }
+            }
+            .background(QuickAskTheme.historyBackground)
+        }
+        .frame(minWidth: 420, minHeight: 260)
+        .background(QuickAskTheme.frameBackground)
     }
 }
 
@@ -2271,6 +2352,7 @@ final class SuggestionFreeTextField: NSTextField {
 
 struct QuickAskView: View {
     @ObservedObject var viewModel: QuickAskViewModel
+    let onOpenHistory: () -> Void
     let onOpenSettings: () -> Void
 
     private func actionButton(_ title: String, action: @escaping () -> Void) -> some View {
@@ -2354,6 +2436,11 @@ struct QuickAskView: View {
                             }
                         }
                         Divider()
+                        Button {
+                            onOpenHistory()
+                        } label: {
+                            Text("History")
+                        }
                         Button {
                             onOpenSettings()
                         } label: {
@@ -2533,6 +2620,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     private var historyHostingView: NSHostingView<QuickAskHistoryView>!
     private var settingsWindow: NSWindow!
     private var settingsHostingView: NSHostingView<QuickAskSettingsView>!
+    private var shortcutsWindow: NSWindow!
+    private var shortcutsHostingView: NSHostingView<QuickAskKeyboardShortcutsView>!
     private var historyViewModel: QuickAskHistoryViewModel!
     private var hotKeyManager: HotKeyManager?
     private var viewModel: QuickAskViewModel!
@@ -2596,6 +2685,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         hostingView = MovableHostingView(
             rootView: QuickAskView(
                 viewModel: viewModel,
+                onOpenHistory: { [weak self] in
+                    self?.toggleHistoryWindow()
+                },
                 onOpenSettings: { [weak self] in
                     self?.showSettingsWindow()
                 }
@@ -2630,6 +2722,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                 onLaunchProviderSetup: { [weak self] providerID in
                     self?.launchProviderSetup(for: providerID)
                 },
+                onOpenShortcuts: { [weak self] in
+                    self?.showShortcutsWindow()
+                },
                 onLayoutChange: { [weak self] in
                     self?.resizeSettingsWindowToFitContent(centerOnScreen: false)
                 },
@@ -2638,6 +2733,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                 },
                 onClose: { [weak self] in
                     self?.hideSettingsWindow()
+                }
+            )
+        )
+
+        shortcutsHostingView = NSHostingView(
+            rootView: QuickAskKeyboardShortcutsView(
+                onClose: { [weak self] in
+                    self?.hideShortcutsWindow()
                 }
             )
         )
@@ -2717,6 +2820,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         }
         settingsWindow.orderOut(nil)
 
+        shortcutsWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 260),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        shortcutsWindow.title = "Keyboard Shortcuts"
+        shortcutsWindow.isReleasedWhenClosed = false
+        shortcutsWindow.isOpaque = true
+        shortcutsWindow.backgroundColor = NSColor(calibratedRed: 0.55, green: 0.79, blue: 0.77, alpha: 1)
+        shortcutsWindow.level = .floating
+        shortcutsWindow.hasShadow = true
+        shortcutsWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        shortcutsWindow.hidesOnDeactivate = false
+        shortcutsWindow.contentView = shortcutsHostingView
+        shortcutsWindow.orderOut(nil)
+
         hotKeyManager = HotKeyManager { [weak self] in
             self?.togglePanel()
         } historyCallback: { [weak self] in
@@ -2726,6 +2846,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if flags == [.command],
+               event.charactersIgnoringModifiers?.lowercased() == "w" {
+                if self.shortcutsWindow.isVisible, self.shortcutsWindow.isKeyWindow {
+                    self.hideShortcutsWindow()
+                    return nil
+                }
+                if self.settingsWindow.isVisible, self.settingsWindow.isKeyWindow {
+                    self.hideSettingsWindow()
+                    return nil
+                }
+                if self.historyWindow.isVisible, self.historyWindow.isKeyWindow {
+                    self.hideHistoryWindow()
+                    return nil
+                }
+                if self.panel.isVisible, self.panel.isKeyWindow {
+                    self.togglePanel()
+                    return nil
+                }
+            }
             if self.panel.isVisible,
                self.panel.isKeyWindow,
                flags == [.command],
@@ -2738,6 +2877,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                flags == [.command],
                (event.keyCode == UInt16(kVK_Return) || event.keyCode == UInt16(kVK_ANSI_KeypadEnter)) {
                 self.viewModel.steerCurrentInput()
+                return nil
+            }
+            if flags == [.command],
+               event.charactersIgnoringModifiers == "," {
+                self.toggleSettingsWindow()
                 return nil
             }
             return event
@@ -2820,7 +2964,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 
     private func hideSettingsWindow() {
+        hideShortcutsWindow()
         settingsWindow.orderOut(nil)
+        uiTestHarness?.writeState()
+    }
+
+    private func toggleSettingsWindow() {
+        if settingsWindow.isVisible {
+            hideSettingsWindow()
+        } else {
+            showSettingsWindow()
+        }
+    }
+
+    private func showShortcutsWindow() {
+        shortcutsWindow.center()
+        shortcutsWindow.makeKeyAndOrderFront(nil)
+        shortcutsWindow.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        uiTestHarness?.writeState()
+    }
+
+    private func hideShortcutsWindow() {
+        shortcutsWindow.orderOut(nil)
         uiTestHarness?.writeState()
     }
 
@@ -2922,6 +3088,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             }
             if settingsWindow.isVisible {
                 hideSettingsWindow()
+            }
+            if shortcutsWindow.isVisible {
+                hideShortcutsWindow()
             }
             viewModel.panelHidden()
             panel.orderOut(nil)
@@ -3191,6 +3360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             panelVisible: panel?.isVisible ?? false,
             historyWindowVisible: historyWindow?.isVisible ?? false,
             settingsWindowVisible: settingsWindow?.isVisible ?? false,
+            shortcutsWindowVisible: shortcutsWindow?.isVisible ?? false,
             panelIsKeyWindow: panel?.isKeyWindow ?? false,
             panelFrame: CodableRect(panel?.frame ?? .zero),
             settingsFrame: CodableRect(settingsWindow?.frame ?? .zero),
@@ -3235,6 +3405,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             quickAskNeedsLayout()
         case "show_settings":
             showSettingsWindow()
+        case "show_shortcuts":
+            showShortcutsWindow()
         case "submit":
             viewModel.send()
         case "complete_generation":
@@ -3292,7 +3464,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             case "cmd_enter":
                 viewModel.steerCurrentInput()
             case "cmd_comma":
-                showSettingsWindow()
+                toggleSettingsWindow()
+            case "cmd_w":
+                if shortcutsWindow.isVisible {
+                    hideShortcutsWindow()
+                } else if settingsWindow.isVisible {
+                    hideSettingsWindow()
+                } else if historyWindow.isVisible {
+                    hideHistoryWindow()
+                } else if panel.isVisible {
+                    togglePanel()
+                }
             case "cmd_shift_backslash":
                 toggleHistoryWindow()
             case "cmd_backslash":

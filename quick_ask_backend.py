@@ -473,7 +473,7 @@ def ollama_provider_status() -> dict[str, Any]:
     if not ollama:
         return {
             "id": "ollama",
-            "label": "Local",
+            "label": "Ollama",
             "available": False,
             "logged_in": False,
             "detail": "Ollama is not installed.",
@@ -490,7 +490,7 @@ def ollama_provider_status() -> dict[str, Any]:
 
     return {
         "id": "ollama",
-        "label": "Local",
+        "label": "Ollama",
         "available": available,
         "logged_in": available,
         "detail": detail,

@@ -480,12 +480,28 @@ class QuickAskUITests(unittest.TestCase):
             self.assertFalse(after["historyWindowVisible"])
             self.assertFalse(after["panelIsKeyWindow"])
 
-    def test_cmd_comma_opens_settings_window_and_keeps_it_on_screen(self) -> None:
+    def test_cmd_comma_toggles_settings_window_and_keeps_it_on_screen(self) -> None:
         with QuickAskHarness() as app:
             shown = app.command("shortcut", shortcut="cmd_comma")
             self.assertTrue(shown["settingsWindowVisible"])
             self.assertGreaterEqual(shown["settingsFrame"]["height"], 320)
             self.assertLessEqual(shown["settingsFrame"]["height"], shown["screenVisibleHeight"] + 1.0)
+            hidden = app.command("shortcut", shortcut="cmd_comma")
+            self.assertFalse(hidden["settingsWindowVisible"])
+
+    def test_show_shortcuts_window(self) -> None:
+        with QuickAskHarness() as app:
+            shown = app.command("show_shortcuts")
+            self.assertTrue(shown["shortcutsWindowVisible"])
+            hidden = app.command("shortcut", shortcut="cmd_w")
+            self.assertFalse(hidden["shortcutsWindowVisible"])
+
+    def test_cmd_w_hides_main_panel(self) -> None:
+        with QuickAskHarness() as app:
+            shown = app.command("show_panel")
+            self.assertTrue(shown["panelVisible"])
+            hidden = app.command("shortcut", shortcut="cmd_w")
+            self.assertFalse(hidden["panelVisible"])
 
     def test_model_visibility_defaults_to_latest_chatgpt_and_can_be_changed(self) -> None:
         with QuickAskHarness() as app:
