@@ -2296,7 +2296,7 @@ struct QuickAskView: View {
                         Text(currentModelShortLabel)
                             .lineLimit(1)
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(QuickAskTheme.strongText)
+                            .foregroundColor(.black)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 6)
                         .background(
@@ -2309,6 +2309,8 @@ struct QuickAskView: View {
                         )
                     }
                     .menuStyle(.borderlessButton)
+                    .foregroundColor(.black)
+                    .tint(.black)
                     .fixedSize()
 
                     Rectangle()
