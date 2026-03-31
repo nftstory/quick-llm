@@ -687,13 +687,15 @@ final class QuickAskViewModel: ObservableObject {
         lastInteractionAt = Date()
     }
 
-    func panelShown() {
+    func panelShown(shouldRequestFocus: Bool = true) {
         touch()
         panelDismissedAt = nil
         pendingDismissResetWorkItem?.cancel()
         pendingDismissResetWorkItem = nil
         QuickAskLog.shared.write("panel shown")
-        requestFocus()
+        if shouldRequestFocus {
+            requestFocus()
+        }
     }
 
     func panelHidden() {
@@ -1613,32 +1615,38 @@ struct QuickAskHistoryRow: View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: 10) {
                 Button(action: onSelect) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(session.preview.isEmpty ? "Untitled session" : session.preview)
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(QuickAskTheme.strongText)
-                            .lineLimit(2)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(alignment: .top, spacing: 0) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(session.preview.isEmpty ? "Untitled session" : session.preview)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(QuickAskTheme.strongText)
+                                .lineLimit(2)
+                                .frame(maxWidth: .infinity, alignment: .leading)
 
-                        HStack(spacing: 8) {
-                            if !session.model.isEmpty {
-                                Text(session.model)
+                            HStack(spacing: 8) {
+                                if !session.model.isEmpty {
+                                    Text(session.model)
+                                        .font(.system(size: 11, weight: .regular))
+                                        .foregroundStyle(QuickAskTheme.mutedText)
+                                        .lineLimit(1)
+                                }
+                                Text("\(session.messageCount) \(session.messageCount == 1 ? "message" : "messages")")
+                                    .font(.system(size: 11, weight: .regular))
+                                    .foregroundStyle(QuickAskTheme.mutedText)
+                                    .lineLimit(1)
+                                Text(relativeSavedAtText)
                                     .font(.system(size: 11, weight: .regular))
                                     .foregroundStyle(QuickAskTheme.mutedText)
                                     .lineLimit(1)
                             }
-                            Text("\(session.messageCount) \(session.messageCount == 1 ? "message" : "messages")")
-                                .font(.system(size: 11, weight: .regular))
-                                .foregroundStyle(QuickAskTheme.mutedText)
-                                .lineLimit(1)
-                            Text(relativeSavedAtText)
-                                .font(.system(size: 11, weight: .regular))
-                                .foregroundStyle(QuickAskTheme.mutedText)
-                                .lineLimit(1)
                         }
+                        Spacer(minLength: 0)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 Button(action: onDelete) {
                     if isDeleting {
@@ -2022,6 +2030,7 @@ private struct KeyboardShortcutItem: Identifiable {
 private let quickAskKeyboardShortcuts: [KeyboardShortcutItem] = [
     KeyboardShortcutItem(keys: "Cmd+\\", description: "Show or hide Quick Ask"),
     KeyboardShortcutItem(keys: "Cmd+Shift+\\", description: "Open or close history"),
+    KeyboardShortcutItem(keys: "Cmd+Shift+N", description: "Open another Quick Ask panel"),
     KeyboardShortcutItem(keys: "Cmd+,", description: "Open settings"),
     KeyboardShortcutItem(keys: "Cmd+N", description: "Start a fresh chat"),
     KeyboardShortcutItem(keys: "Enter", description: "Send the current prompt"),
@@ -3072,8 +3081,7 @@ final class QuickAskUITestHarness {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate {
-    private var panel: QuickAskPanel!
-    private var hostingView: MovableHostingView<QuickAskView>!
+    private var chatPanels: [ChatPanelContext] = []
     private var historyWindow: NSWindow!
     private var historyHostingView: NSHostingView<QuickAskHistoryView>!
     private var settingsWindow: NSWindow!
@@ -3082,11 +3090,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     private var shortcutsHostingView: NSHostingView<QuickAskKeyboardShortcutsView>!
     private var historyViewModel: QuickAskHistoryViewModel!
     private var hotKeyManager: HotKeyManager?
-    private var viewModel: QuickAskViewModel!
     private var settings: QuickAskAppSettings!
     private var localKeyMonitor: Any?
-    private var panelBottomY: CGFloat?
-    private var isProgrammaticPanelMove = false
     private var uiTestHarness: QuickAskUITestHarness?
     private var backendPath = ""
     private let defaults = quickAskUserDefaults()
@@ -3097,6 +3102,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     private let uiTestForceSetupGate = ProcessInfo.processInfo.environment["QUICK_ASK_UI_TEST_FORCE_SETUP_GATE"] == "1"
     private var singletonLockFileDescriptor: Int32 = -1
     private var frontmostAppName = ""
+    private var lastActivePanelID: UUID?
+
+    private var primaryPanelContext: ChatPanelContext {
+        chatPanels[0]
+    }
+
+    private var panel: QuickAskPanel {
+        primaryPanelContext.panel
+    }
+
+    private var hostingView: MovableHostingView<QuickAskView> {
+        primaryPanelContext.hostingView
+    }
+
+    private var viewModel: QuickAskViewModel {
+        primaryPanelContext.viewModel
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -3119,39 +3141,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
 
         backendPath = resolveBackendPath()
         settings = QuickAskAppSettings(defaults: defaults)
-        viewModel = QuickAskViewModel(
-            backendPath: backendPath,
-            processEnvironmentProvider: { [weak self] in
-                self?.settings.processEnvironment() ?? ProcessInfo.processInfo.environment
-            },
-            visibleModelsProvider: { [weak self] models in
-                self?.settings.visibleModels(from: models) ?? models
-            },
-            availableModelsObserver: { [weak self] models in
-                self?.settings.setAvailableModels(models)
-            },
-            defaults: defaults
-        )
-        viewModel.layoutDelegate = self
         historyViewModel = QuickAskHistoryViewModel(
             backendPath: backendPath,
             processEnvironmentProvider: { [weak self] in
                 self?.settings.processEnvironment() ?? ProcessInfo.processInfo.environment
             }
         )
-
-        hostingView = MovableHostingView(
-            rootView: QuickAskView(
-                viewModel: viewModel,
-                onOpenHistory: { [weak self] in
-                    self?.toggleHistoryWindow()
-                },
-                onOpenSettings: { [weak self] in
-                    self?.showSettingsWindow()
-                }
-            )
-        )
-        hostingView.frame = NSRect(x: 0, y: 0, width: 560, height: 70)
+        let primaryPanel = createChatPanel(isPrimary: true)
+        chatPanels = [primaryPanel]
+        lastActivePanelID = primaryPanel.id
 
         historyHostingView = NSHostingView(
             rootView: QuickAskHistoryView(
@@ -3201,32 +3199,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                     self?.hideShortcutsWindow()
                 }
             )
-        )
-
-        panel = QuickAskPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 70),
-            styleMask: [.borderless, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        panel.isReleasedWhenClosed = false
-        panel.isOpaque = true
-        panel.backgroundColor = NSColor(calibratedRed: 0.55, green: 0.79, blue: 0.77, alpha: 1)
-        panel.level = .floating
-        panel.hasShadow = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        panel.hidesOnDeactivate = false
-        panel.isMovableByWindowBackground = true
-        panel.contentView = hostingView
-        panel.orderOut(nil)
-        panel.onNewChat = { [weak self] in
-            self?.startNewChat()
-        }
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleWindowDidMove(_:)),
-            name: NSWindow.didMoveNotification,
-            object: panel
         )
 
         historyWindow = NSWindow(
@@ -3304,6 +3276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            let keyPanelContext = self.keyChatPanelContext()
             if flags == [.command],
                event.charactersIgnoringModifiers?.lowercased() == "w" {
                 if self.shortcutsWindow.isVisible, self.shortcutsWindow.isKeyWindow {
@@ -3318,66 +3291,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                     self.hideHistoryWindow()
                     return nil
                 }
-                if self.panel.isVisible, self.panel.isKeyWindow {
-                    self.togglePanel()
+                if let keyPanelContext {
+                    self.hidePanel(keyPanelContext)
                     return nil
                 }
             }
-            if self.panel.isVisible,
-               self.panel.isKeyWindow,
+            if let keyPanelContext,
                flags == [.command],
                event.charactersIgnoringModifiers?.lowercased() == "n" {
-                self.startNewChat()
+                self.startNewChat(in: keyPanelContext.id)
                 return nil
             }
-            if self.panel.isVisible,
-               self.panel.isKeyWindow,
+            if let keyPanelContext,
+               flags == [.command, .shift],
+               event.charactersIgnoringModifiers?.lowercased() == "n" {
+                self.createAndShowAdditionalPanel(relativeTo: keyPanelContext)
+                return nil
+            }
+            if let keyPanelContext,
                flags == [.command],
                (event.keyCode == UInt16(kVK_Return) || event.keyCode == UInt16(kVK_ANSI_KeypadEnter)) {
-                self.viewModel.steerCurrentInput()
+                keyPanelContext.viewModel.steerCurrentInput()
                 return nil
             }
-            if self.panel.isVisible,
-               self.panel.isKeyWindow,
-               self.panelInputIsFocused(),
+            if let keyPanelContext,
+               self.panelInputIsFocused(keyPanelContext),
                flags == [.command],
                event.charactersIgnoringModifiers?.lowercased() == "v" {
                 let attachments = ChatAttachment.attachments()
                 if !attachments.isEmpty {
-                    self.viewModel.addPendingAttachments(attachments)
+                    keyPanelContext.viewModel.addPendingAttachments(attachments)
                     return nil
                 }
             }
-            if self.panel.isVisible,
-               self.panel.isKeyWindow,
-               self.panelInputIsFocused(),
+            if let keyPanelContext,
+               self.panelInputIsFocused(keyPanelContext),
                flags == [.control, .shift],
                event.keyCode == UInt16(kVK_Tab) {
-                self.viewModel.cycleProvider(by: -1)
+                keyPanelContext.viewModel.cycleProvider(by: -1)
                 return nil
             }
-            if self.panel.isVisible,
-               self.panel.isKeyWindow,
-               self.panelInputIsFocused(),
+            if let keyPanelContext,
+               self.panelInputIsFocused(keyPanelContext),
                flags == [.control],
                event.keyCode == UInt16(kVK_Tab) {
-                self.viewModel.cycleProvider(by: 1)
+                keyPanelContext.viewModel.cycleProvider(by: 1)
                 return nil
             }
-            if self.panel.isVisible,
-               self.panel.isKeyWindow,
-               self.panelInputIsFocused(),
+            if let keyPanelContext,
+               self.panelInputIsFocused(keyPanelContext),
                flags == [.command],
                event.keyCode == UInt16(kVK_ANSI_LeftBracket) {
-                self.viewModel.cycleModel(by: -1)
+                keyPanelContext.viewModel.cycleModel(by: -1)
                 return nil
             }
-            if self.panel.isVisible,
-               self.panel.isKeyWindow,
-               self.panelInputIsFocused(),
+            if let keyPanelContext,
+               self.panelInputIsFocused(keyPanelContext),
                flags == [.command],
                event.keyCode == UInt16(kVK_ANSI_RightBracket) {
-                self.viewModel.cycleModel(by: 1)
+                keyPanelContext.viewModel.cycleModel(by: 1)
                 return nil
             }
             if flags == [.command],
@@ -3406,7 +3378,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 
     func quickAskNeedsLayout() {
-        guard let panel, let hostingView else { return }
+        quickAskNeedsLayout(for: primaryPanelContext.id)
+    }
+
+    func quickAskNeedsLayout(for panelID: UUID) {
+        guard let context = chatPanelContext(for: panelID) else { return }
+        let panel = context.panel
+        let hostingView = context.hostingView
         hostingView.layoutSubtreeIfNeeded()
         let fitting = hostingView.fittingSize
         let targetWidth: CGFloat = 560
@@ -3415,46 +3393,235 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         let testBottomY: CGFloat = 120
 
         var frame = panel.frame
-        isProgrammaticPanelMove = true
+        context.isProgrammaticMove = true
         if !panel.isVisible {
             if uiTestMode {
                 frame = NSRect(x: testOriginX, y: testBottomY, width: targetWidth, height: targetHeight)
-            } else if let savedOriginX = defaults.object(forKey: panelOriginXKey) as? Double,
-               let savedBottomY = defaults.object(forKey: panelBottomYKey) as? Double {
+            } else if context.isPrimary,
+                      let savedOriginX = defaults.object(forKey: panelOriginXKey) as? Double,
+                      let savedBottomY = defaults.object(forKey: panelBottomYKey) as? Double {
                 frame = NSRect(
                     x: round(savedOriginX),
                     y: round(savedBottomY),
                     width: targetWidth,
                     height: targetHeight
                 )
-            } else {
+            } else if frame.equalTo(.zero) || frame.width == 0 || frame.height == 0 {
                 frame = initialFrame(width: targetWidth, height: targetHeight)
             }
             let anchoredBottomY = round(frame.minY)
             frame.origin.y = anchoredBottomY
             frame.size.width = targetWidth
             frame.size.height = targetHeight
-            panelBottomY = anchoredBottomY
+            context.panelBottomY = anchoredBottomY
         } else {
-            let anchoredBottomY = uiTestMode ? testBottomY : round(panelBottomY ?? panel.frame.minY)
-            if uiTestMode {
+            let anchoredBottomY = uiTestMode ? testBottomY : round(context.panelBottomY ?? panel.frame.minY)
+            if uiTestMode && context.isPrimary {
                 frame.origin.x = testOriginX
             }
             frame.origin.y = anchoredBottomY
             frame.size.height = targetHeight
             frame.size.width = targetWidth
-            panelBottomY = anchoredBottomY
+            context.panelBottomY = anchoredBottomY
         }
         panel.setFrame(frame, display: true)
-        if let anchoredBottomY = panelBottomY {
+        if let anchoredBottomY = context.panelBottomY {
             let targetOrigin = NSPoint(x: round(frame.origin.x), y: anchoredBottomY)
             if abs(panel.frame.origin.x - targetOrigin.x) > 0.5 || abs(panel.frame.minY - targetOrigin.y) > 0.5 {
                 panel.setFrameOrigin(targetOrigin)
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.isProgrammaticPanelMove = false
+            self?.chatPanelContext(for: panelID)?.isProgrammaticMove = false
         }
+        uiTestHarness?.writeState()
+    }
+
+    private func chatPanelContext(for panelID: UUID) -> ChatPanelContext? {
+        chatPanels.first(where: { $0.id == panelID })
+    }
+
+    private func chatPanelContext(for window: NSWindow?) -> ChatPanelContext? {
+        guard let window else { return nil }
+        return chatPanels.first(where: { $0.panel == window })
+    }
+
+    private func keyChatPanelContext() -> ChatPanelContext? {
+        chatPanels.first(where: { $0.panel.isVisible && $0.panel.isKeyWindow })
+    }
+
+    private func activeChatPanelContext(preferVisible: Bool = true) -> ChatPanelContext? {
+        if let key = keyChatPanelContext() {
+            return key
+        }
+        if let lastActivePanelID,
+           let lastActive = chatPanelContext(for: lastActivePanelID),
+           (!preferVisible || lastActive.panel.isVisible) {
+            return lastActive
+        }
+        if preferVisible, let visible = chatPanels.first(where: { $0.panel.isVisible }) {
+            return visible
+        }
+        return chatPanels.first
+    }
+
+    private func createChatPanel(isPrimary: Bool, initialFrame: NSRect? = nil) -> ChatPanelContext {
+        let panelID = UUID()
+        let panelViewModel = QuickAskViewModel(
+            backendPath: backendPath,
+            processEnvironmentProvider: { [weak self] in
+                self?.settings.processEnvironment() ?? ProcessInfo.processInfo.environment
+            },
+            visibleModelsProvider: { [weak self] models in
+                self?.settings.visibleModels(from: models) ?? models
+            },
+            availableModelsObserver: { [weak self] models in
+                self?.settings.setAvailableModels(models)
+            },
+            defaults: defaults
+        )
+        let layoutProxy = ChatPanelLayoutProxy(appDelegate: self, panelID: panelID)
+        panelViewModel.layoutDelegate = layoutProxy
+
+        let hostingView = MovableHostingView(
+            rootView: QuickAskView(
+                viewModel: panelViewModel,
+                onOpenHistory: { [weak self] in
+                    self?.toggleHistoryWindow()
+                },
+                onOpenSettings: { [weak self] in
+                    self?.showSettingsWindow()
+                }
+            )
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 560, height: 70)
+
+        let panel = QuickAskPanel(
+            contentRect: initialFrame ?? NSRect(x: 0, y: 0, width: 560, height: 70),
+            styleMask: [.borderless, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isReleasedWhenClosed = false
+        panel.isOpaque = true
+        panel.backgroundColor = NSColor(calibratedRed: 0.55, green: 0.79, blue: 0.77, alpha: 1)
+        panel.level = .floating
+        panel.hasShadow = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.hidesOnDeactivate = false
+        panel.isMovableByWindowBackground = true
+        panel.contentView = hostingView
+        panel.orderOut(nil)
+        panel.onNewChat = { [weak self] in
+            self?.startNewChat(in: panelID)
+        }
+
+        let context = ChatPanelContext(
+            id: panelID,
+            isPrimary: isPrimary,
+            viewModel: panelViewModel,
+            hostingView: hostingView,
+            panel: panel,
+            layoutProxy: layoutProxy
+        )
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleWindowDidMove(_:)),
+            name: NSWindow.didMoveNotification,
+            object: panel
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleChatPanelDidBecomeKey(_:)),
+            name: NSWindow.didBecomeKeyNotification,
+            object: panel
+        )
+
+        panelViewModel.loadModels()
+        if let initialFrame {
+            panel.setFrame(initialFrame, display: false)
+            context.panelBottomY = initialFrame.minY
+        }
+        return context
+    }
+
+    private func nextPanelFrame(relativeTo context: ChatPanelContext?) -> NSRect {
+        let baseFrame: NSRect
+        if let context {
+            baseFrame = context.panel.frame
+        } else {
+            baseFrame = initialFrame(width: 560, height: 70)
+        }
+        let visible = currentScreen()?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let width = baseFrame.width > 0 ? baseFrame.width : 560
+        let height = baseFrame.height > 0 ? baseFrame.height : 70
+        var frame = baseFrame.offsetBy(dx: 28, dy: -28)
+        frame.size.width = width
+        frame.size.height = height
+        frame.origin.x = min(max(frame.origin.x, visible.minX), visible.maxX - width)
+        frame.origin.y = min(max(frame.origin.y, visible.minY), visible.maxY - height)
+        return frame
+    }
+
+    private func showPanel(_ context: ChatPanelContext, makeKey: Bool = true, activate: Bool = true) {
+        guard !shouldGateOnSetup() else {
+            showSettingsWindow()
+            return
+        }
+        quickAskNeedsLayout(for: context.id)
+        if makeKey {
+            context.panel.makeKeyAndOrderFront(nil)
+            lastActivePanelID = context.id
+        } else {
+            context.panel.orderFrontRegardless()
+        }
+        if activate {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        quickAskNeedsLayout(for: context.id)
+        context.viewModel.panelShown(shouldRequestFocus: makeKey)
+        settleVisiblePanel(context)
+    }
+
+    private func showAllPanels() {
+        guard !shouldGateOnSetup() else {
+            showSettingsWindow()
+            return
+        }
+        let targetContext = activeChatPanelContext(preferVisible: false) ?? primaryPanelContext
+        QuickAskLog.shared.write("showAllPanels count=\(chatPanels.count)")
+        for context in chatPanels where context.id != targetContext.id {
+            showPanel(context, makeKey: false, activate: false)
+        }
+        showPanel(targetContext, makeKey: true, activate: true)
+        uiTestHarness?.writeState()
+    }
+
+    private func hidePanel(_ context: ChatPanelContext) {
+        QuickAskLog.shared.write("hidePanel id=\(context.id.uuidString)")
+        context.viewModel.panelHidden()
+        context.panel.orderOut(nil)
+        uiTestHarness?.writeState()
+    }
+
+    private func hideAllPanels() {
+        QuickAskLog.shared.write("hideAllPanels count=\(chatPanels.filter { $0.panel.isVisible }.count)")
+        for context in chatPanels where context.panel.isVisible {
+            hidePanel(context)
+        }
+    }
+
+    private func createAndShowAdditionalPanel(relativeTo context: ChatPanelContext? = nil) {
+        guard !shouldGateOnSetup() else {
+            showSettingsWindow()
+            return
+        }
+        let referenceContext = context ?? activeChatPanelContext(preferVisible: false)
+        let newContext = createChatPanel(isPrimary: false, initialFrame: nextPanelFrame(relativeTo: referenceContext))
+        chatPanels.append(newContext)
+        lastActivePanelID = newContext.id
+        showPanel(newContext)
         uiTestHarness?.writeState()
     }
 
@@ -3497,20 +3664,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 
     private func chooseArchiveDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = true
-        panel.prompt = "Choose"
-        panel.title = "Choose Archive Folder"
-        panel.directoryURL = settings.effectiveArchiveDirectory?
+        let chooser = NSOpenPanel()
+        chooser.canChooseDirectories = true
+        chooser.canChooseFiles = false
+        chooser.allowsMultipleSelection = false
+        chooser.canCreateDirectories = true
+        chooser.prompt = "Choose"
+        chooser.title = "Choose Archive Folder"
+        chooser.directoryURL = settings.effectiveArchiveDirectory?
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             ?? FileManager.default.homeDirectoryForCurrentUser
-        if panel.runModal() == .OK, let url = panel.url {
+        if chooser.runModal() == .OK, let url = chooser.url {
             settings.setCustomArchiveDirectory(url)
-            viewModel.persistCurrentTranscript()
+            persistAllTranscripts()
             refreshSettingsStatus()
             historyViewModel.reload()
         }
@@ -3518,7 +3685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
 
     private func clearArchiveDirectory() {
         settings.clearCustomArchiveDirectory()
-        viewModel.persistCurrentTranscript()
+        persistAllTranscripts()
         refreshSettingsStatus()
         historyViewModel.reload()
     }
@@ -3526,7 +3693,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     private func refreshSettingsStatus() {
         settings.refreshProviderStatuses(backendPath: backendPath)
         settings.refreshStorageStatus(backendPath: backendPath, ensureKey: settings.historyEnabled)
-        viewModel.loadModels()
+        reloadAllPanelModels()
         historyViewModel.reload()
     }
 
@@ -3540,7 +3707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         refreshSettingsStatus()
         hideSettingsWindow()
         if shouldRevealPanel {
-            showPanel()
+            showAllPanels()
         }
     }
 
@@ -3586,9 +3753,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         }
     }
 
+    private func persistAllTranscripts() {
+        for context in chatPanels {
+            context.viewModel.persistCurrentTranscript()
+        }
+    }
+
+    private func reloadAllPanelModels() {
+        for context in chatPanels {
+            context.viewModel.loadModels()
+        }
+    }
+
     private func togglePanel() {
-        if panel.isVisible {
-            QuickAskLog.shared.write("togglePanel hiding panel")
+        if chatPanels.contains(where: { $0.panel.isVisible }) {
+            QuickAskLog.shared.write("togglePanel hiding all panels")
             if historyWindow.isVisible {
                 hideHistoryWindow()
             }
@@ -3598,47 +3777,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             if shortcutsWindow.isVisible {
                 hideShortcutsWindow()
             }
-            viewModel.panelHidden()
-            panel.orderOut(nil)
-            uiTestHarness?.writeState()
+            hideAllPanels()
             return
         }
 
-        guard !shouldGateOnSetup() else {
-            showSettingsWindow()
-            return
-        }
-
-        QuickAskLog.shared.write("togglePanel showing panel")
-        quickAskNeedsLayout()
-        panel.makeKeyAndOrderFront(nil)
-        panel.orderFrontRegardless()
-        NSApp.activate(ignoringOtherApps: true)
-        quickAskNeedsLayout()
-        viewModel.panelShown()
-        settleVisiblePanel()
-        uiTestHarness?.writeState()
+        QuickAskLog.shared.write("togglePanel showing all panels")
+        showAllPanels()
     }
 
-    private func showPanel() {
-        QuickAskLog.shared.write("showPanel")
-        guard !shouldGateOnSetup() else {
-            showSettingsWindow()
-            return
-        }
-        quickAskNeedsLayout()
-        panel.makeKeyAndOrderFront(nil)
-        panel.orderFrontRegardless()
-        NSApp.activate(ignoringOtherApps: true)
-        quickAskNeedsLayout()
-        viewModel.panelShown()
-        settleVisiblePanel()
-        uiTestHarness?.writeState()
+    private func showPanel(panelID: UUID? = nil) {
+        let context = panelID.flatMap(chatPanelContext(for:)) ?? activeChatPanelContext(preferVisible: false) ?? primaryPanelContext
+        QuickAskLog.shared.write("showPanel id=\(context.id.uuidString)")
+        showPanel(context)
     }
 
-    private func panelInputIsFocused() -> Bool {
-        guard panel.isVisible, panel.isKeyWindow else { return false }
-        if let editor = panel.firstResponder as? NSTextView, editor.isFieldEditor {
+    private func panelInputIsFocused(_ context: ChatPanelContext) -> Bool {
+        guard context.panel.isVisible, context.panel.isKeyWindow else { return false }
+        if let editor = context.panel.firstResponder as? NSTextView, editor.isFieldEditor {
             return true
         }
         return false
@@ -3676,7 +3831,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
 
     private func restoreSession(_ session: QuickAskHistorySession) {
         hideHistoryWindow()
-        loadSession(session.sessionID)
+        loadSession(session.sessionID, panelID: activeChatPanelContext(preferVisible: false)?.id)
     }
 
     func showSettingsFromAppMenu() {
@@ -3684,16 +3839,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func startNewChat() {
-        guard panel.isVisible else { return }
-        viewModel.newChat()
-        quickAskNeedsLayout()
+    private func startNewChat(in panelID: UUID? = nil) {
+        guard let context = panelID.flatMap(chatPanelContext(for:)) ?? activeChatPanelContext(),
+              context.panel.isVisible else { return }
+        context.viewModel.newChat()
+        quickAskNeedsLayout(for: context.id)
     }
 
-    private func settleVisiblePanel() {
+    private func settleVisiblePanel(_ context: ChatPanelContext) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.panel.isVisible else { return }
-            self.quickAskNeedsLayout()
+            guard let self, context.panel.isVisible else { return }
+            self.quickAskNeedsLayout(for: context.id)
             self.uiTestHarness?.writeState()
         }
     }
@@ -3791,7 +3947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         }
     }
 
-    private func loadSession(_ sessionID: String) {
+    private func loadSession(_ sessionID: String, panelID: UUID? = nil) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["python3", resolveBackendPath(), "load", "--session-id", sessionID]
@@ -3811,14 +3967,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             guard let payload = try? JSONDecoder().decode(QuickAskLoadedEnvelope.self, from: stdoutData), payload.type == "session" else {
                 let message = String(data: stderrData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                viewModel.statusText = message?.isEmpty == false ? (message ?? "Could not restore session.") : "Could not restore session."
+                let targetContext = panelID.flatMap(chatPanelContext(for:)) ?? activeChatPanelContext(preferVisible: false) ?? primaryPanelContext
+                targetContext.viewModel.statusText = message?.isEmpty == false ? (message ?? "Could not restore session.") : "Could not restore session."
                 return
             }
 
-            viewModel.restoreSession(payload.session)
-            showPanel()
+            let targetContext = panelID.flatMap(chatPanelContext(for:)) ?? activeChatPanelContext(preferVisible: false) ?? primaryPanelContext
+            targetContext.viewModel.restoreSession(payload.session)
+            showPanel(panelID: targetContext.id)
         } catch {
-            viewModel.statusText = "Could not restore session."
+            let targetContext = panelID.flatMap(chatPanelContext(for:)) ?? activeChatPanelContext(preferVisible: false) ?? primaryPanelContext
+            targetContext.viewModel.statusText = "Could not restore session."
         }
     }
 
@@ -3834,10 +3993,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
 
     @objc
     private func handleWindowDidMove(_ notification: Notification) {
-        guard !isProgrammaticPanelMove else { return }
-        panelBottomY = panel?.frame.minY
-        defaults.set(panel?.frame.minX ?? 0, forKey: panelOriginXKey)
-        defaults.set(panel?.frame.minY ?? 0, forKey: panelBottomYKey)
+        guard let context = chatPanelContext(for: notification.object as? NSWindow) else { return }
+        guard !context.isProgrammaticMove else { return }
+        context.panelBottomY = context.panel.frame.minY
+        if context.isPrimary {
+            defaults.set(context.panel.frame.minX, forKey: panelOriginXKey)
+            defaults.set(context.panel.frame.minY, forKey: panelBottomYKey)
+        }
+        uiTestHarness?.writeState()
+    }
+
+    @objc
+    private func handleChatPanelDidBecomeKey(_ notification: Notification) {
+        guard let context = chatPanelContext(for: notification.object as? NSWindow) else { return }
+        lastActivePanelID = context.id
         uiTestHarness?.writeState()
     }
 
@@ -3858,12 +4027,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 
     fileprivate func uiTestState(handledCommandID: Int) -> QuickAskUITestState {
-        let selectedModel: String
-        if let viewModel {
-            selectedModel = viewModel.models.first(where: { $0.id == viewModel.selectedModelID })?.shortLabel ?? ""
-        } else {
-            selectedModel = ""
-        }
+        let context = activeChatPanelContext(preferVisible: false) ?? chatPanels.first
+        let panel = context?.panel
+        let viewModel = context?.viewModel
+        let selectedModel = viewModel?.models.first(where: { $0.id == viewModel?.selectedModelID })?.shortLabel ?? ""
         let visibleModelIDs = viewModel?.models.map(\.id) ?? []
         let screenVisibleHeight = panel?.screen?.visibleFrame.height
             ?? settingsWindow?.screen?.visibleFrame.height
@@ -3904,33 +4071,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 
     fileprivate func handleUITestCommand(_ command: QuickAskUITestCommand) {
+        let activeContext = activeChatPanelContext(preferVisible: false) ?? primaryPanelContext
         switch command.action {
         case "show_panel":
-            showPanel()
+            showAllPanels()
         case "hide_panel":
-            if panel.isVisible {
+            if activeContext.panel.isVisible {
                 if historyWindow.isVisible {
                     hideHistoryWindow()
                 }
-                viewModel.panelHidden()
-                panel.orderOut(nil)
+                hidePanel(activeContext)
             }
         case "set_input":
-            viewModel.inputText = command.text ?? ""
-            viewModel.touch()
-            quickAskNeedsLayout()
+            activeContext.viewModel.inputText = command.text ?? ""
+            activeContext.viewModel.touch()
+            quickAskNeedsLayout(for: activeContext.id)
         case "show_settings":
             showSettingsWindow()
         case "show_shortcuts":
             showShortcutsWindow()
         case "submit":
-            viewModel.send()
+            activeContext.viewModel.send()
         case "complete_generation":
-            viewModel.completeTestGeneration(with: command.text ?? "")
+            activeContext.viewModel.completeTestGeneration(with: command.text ?? "")
         case "fail_generation":
-            viewModel.failTestGeneration(with: command.text ?? "The reply failed.")
+            activeContext.viewModel.failTestGeneration(with: command.text ?? "The reply failed.")
         case "new_chat":
-            startNewChat()
+            startNewChat(in: activeContext.id)
         case "complete_setup":
             completeInitialSetup()
         case "set_history_enabled":
@@ -3947,11 +4114,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                 let modelID = String(text[..<separator])
                 let visible = String(text[text.index(after: separator)...]) != "0"
                 settings.setModelVisible(modelID, visible: visible)
-                viewModel.loadModels()
+                reloadAllPanelModels()
             }
         case "select_model":
             if let text = command.text, !text.isEmpty {
-                viewModel.selectModel(text)
+                activeContext.viewModel.selectModel(text)
             }
         case "clear_archive_dir":
             clearArchiveDirectory()
@@ -3960,39 +4127,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                 historyViewModel.deleteSession(text)
             }
         case "clear_queue":
-            viewModel.clearQueuedPrompts()
+            activeContext.viewModel.clearQueuedPrompts()
         case "steer_queue_item":
             if let text = command.text,
-               let prompt = viewModel.queuedPrompts.first(where: { $0.content == text }) {
-                viewModel.steerQueuedPrompt(id: prompt.id)
+               let prompt = activeContext.viewModel.queuedPrompts.first(where: { $0.content == text }) {
+                activeContext.viewModel.steerQueuedPrompt(id: prompt.id)
             }
         case "cancel_queue_item":
             if let text = command.text,
-               let prompt = viewModel.queuedPrompts.first(where: { $0.content == text }) {
-                viewModel.cancelQueuedPrompt(id: prompt.id)
+               let prompt = activeContext.viewModel.queuedPrompts.first(where: { $0.content == text }) {
+                activeContext.viewModel.cancelQueuedPrompt(id: prompt.id)
             }
         case "refresh_models":
-            viewModel.loadModels()
+            reloadAllPanelModels()
         case "retry_failed_turn":
-            viewModel.retryLastFailedTurn()
+            activeContext.viewModel.retryLastFailedTurn()
         case "request_focus":
-            viewModel.requestFocus()
+            activeContext.viewModel.requestFocus()
         case "force_idle_timeout_elapsed":
-            viewModel.forceIdleTimeoutElapsedForTesting(panelIsVisible: panel.isVisible)
+            activeContext.viewModel.forceIdleTimeoutElapsedForTesting(panelIsVisible: activeContext.panel.isVisible)
         case "shortcut":
             switch command.shortcut {
             case "cmd_n":
-                startNewChat()
+                startNewChat(in: activeContext.id)
+            case "cmd_shift_n":
+                createAndShowAdditionalPanel(relativeTo: activeContext)
             case "cmd_enter":
-                viewModel.steerCurrentInput()
+                activeContext.viewModel.steerCurrentInput()
             case "ctrl_tab":
-                viewModel.cycleProvider(by: 1)
+                activeContext.viewModel.cycleProvider(by: 1)
             case "ctrl_shift_tab":
-                viewModel.cycleProvider(by: -1)
+                activeContext.viewModel.cycleProvider(by: -1)
             case "cmd_left_bracket":
-                viewModel.cycleModel(by: -1)
+                activeContext.viewModel.cycleModel(by: -1)
             case "cmd_right_bracket":
-                viewModel.cycleModel(by: 1)
+                activeContext.viewModel.cycleModel(by: 1)
             case "cmd_comma":
                 toggleSettingsWindow()
             case "cmd_w":
@@ -4002,8 +4171,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                     hideSettingsWindow()
                 } else if historyWindow.isVisible {
                     hideHistoryWindow()
-                } else if panel.isVisible {
-                    togglePanel()
+                } else if activeContext.panel.isVisible {
+                    hidePanel(activeContext)
                 }
             case "cmd_shift_backslash":
                 toggleHistoryWindow()
@@ -4020,6 +4189,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
 }
 
 final class MovableHostingView<Content: View>: NSHostingView<Content> {}
+
+@MainActor
+final class ChatPanelLayoutProxy: QuickAskLayoutDelegate {
+    weak var appDelegate: AppDelegate?
+    let panelID: UUID
+
+    init(appDelegate: AppDelegate, panelID: UUID) {
+        self.appDelegate = appDelegate
+        self.panelID = panelID
+    }
+
+    func quickAskNeedsLayout() {
+        appDelegate?.quickAskNeedsLayout(for: panelID)
+    }
+}
+
+@MainActor
+final class ChatPanelContext {
+    let id: UUID
+    let isPrimary: Bool
+    let viewModel: QuickAskViewModel
+    let hostingView: MovableHostingView<QuickAskView>
+    let panel: QuickAskPanel
+    let layoutProxy: ChatPanelLayoutProxy
+    var panelBottomY: CGFloat?
+    var isProgrammaticMove = false
+
+    init(
+        id: UUID,
+        isPrimary: Bool,
+        viewModel: QuickAskViewModel,
+        hostingView: MovableHostingView<QuickAskView>,
+        panel: QuickAskPanel,
+        layoutProxy: ChatPanelLayoutProxy
+    ) {
+        self.id = id
+        self.isPrimary = isPrimary
+        self.viewModel = viewModel
+        self.hostingView = hostingView
+        self.panel = panel
+        self.layoutProxy = layoutProxy
+    }
+}
 
 private struct SettingsRedirectView: View {
     let onRedirect: () -> Void
