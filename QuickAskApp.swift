@@ -2377,6 +2377,7 @@ private struct MessageContentView: View {
                 }
             }
         }
+        .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -2426,6 +2427,7 @@ private struct MessageMarkdownTableView: View {
                 }
             }
         }
+        .textSelection(.enabled)
         .background(Color.white.opacity(0.08))
         .overlay(Rectangle().stroke(Color.black.opacity(0.14), lineWidth: 1))
     }
