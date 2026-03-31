@@ -2036,7 +2036,7 @@ private let quickAskKeyboardShortcuts: [KeyboardShortcutItem] = [
     KeyboardShortcutItem(keys: "Enter", description: "Send the current prompt"),
     KeyboardShortcutItem(keys: "Cmd+Enter", description: "Steer the current draft ahead of the queue"),
     KeyboardShortcutItem(keys: "Cmd+[ / Cmd+]", description: "Switch to the previous or next visible model"),
-    KeyboardShortcutItem(keys: "Ctrl+Tab / Ctrl+Shift+Tab", description: "Switch to the next or previous model provider"),
+    KeyboardShortcutItem(keys: "Ctrl+Tab / Ctrl+Shift+Tab", description: "Switch to the next or previous visible model"),
 ]
 
 struct QuickAskKeyboardShortcutsView: View {
@@ -3328,14 +3328,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                self.panelInputIsFocused(keyPanelContext),
                flags == [.control, .shift],
                event.keyCode == UInt16(kVK_Tab) {
-                keyPanelContext.viewModel.cycleProvider(by: -1)
+                keyPanelContext.viewModel.cycleModel(by: -1)
                 return nil
             }
             if let keyPanelContext,
                self.panelInputIsFocused(keyPanelContext),
                flags == [.control],
                event.keyCode == UInt16(kVK_Tab) {
-                keyPanelContext.viewModel.cycleProvider(by: 1)
+                keyPanelContext.viewModel.cycleModel(by: 1)
                 return nil
             }
             if let keyPanelContext,
@@ -4155,9 +4155,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             case "cmd_enter":
                 activeContext.viewModel.steerCurrentInput()
             case "ctrl_tab":
-                activeContext.viewModel.cycleProvider(by: 1)
+                activeContext.viewModel.cycleModel(by: 1)
             case "ctrl_shift_tab":
-                activeContext.viewModel.cycleProvider(by: -1)
+                activeContext.viewModel.cycleModel(by: -1)
             case "cmd_left_bracket":
                 activeContext.viewModel.cycleModel(by: -1)
             case "cmd_right_bracket":
