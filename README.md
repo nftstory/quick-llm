@@ -20,6 +20,7 @@ The app lives above your other windows, keeps the input bar pinned while the con
 - Steer to the next queued prompt with `Cmd+Enter`
 - Cancel queued prompts without interrupting the current reply
 - Steer or remove each queued prompt individually
+- Paste images from the clipboard into the composer for supported models
 - Restore earlier chats from encrypted saved history
 - Delete saved threads directly from the history window
 - Show a small setup screen only when history is enabled but no archive folder has been chosen yet
@@ -72,6 +73,7 @@ That script:
    - `gemini`
 4. Press `Cmd+\` to show or hide the panel.
 5. Type a prompt and press `Enter`.
+   You can also paste images directly into the input with `Cmd+V`.
 6. Use the model menu to switch providers or open `Settings…`.
    You can also open `History` directly from that menu.
 7. Press `Cmd+Shift+\` to browse prior chats when history is enabled.
@@ -79,6 +81,11 @@ That script:
 9. Use the `Keyboard Shortcuts` button in settings for a compact shortcut reference.
 
 If at least one provider or local model is already available, Quick Ask does not block you on provider setup. Provider status in `Settings…` is informational and reusable, not an API-key onboarding flow.
+
+Image support notes:
+
+- Pasted images are currently forwarded to ChatGPT/Codex and Ollama models.
+- Claude and Gemini stay available for text, but Quick Ask will ask you to switch models if you try to send pasted images through those providers.
 
 Model switching semantics:
 
@@ -109,6 +116,7 @@ Additional smoke tests:
 
 ```zsh
 python3 tests/test_backend_env.py -v
+python3 tests/test_quick_ask_backend_images.py -v
 python3 tests/test_fresh_install.py -v
 ```
 

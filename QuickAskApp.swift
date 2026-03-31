@@ -2,6 +2,7 @@ import AppKit
 import Carbon.HIToolbox
 import Darwin
 import SwiftUI
+import UniformTypeIdentifiers
 
 final class QuickAskLog {
     static let shared = QuickAskLog()
@@ -49,21 +50,109 @@ struct ChatMessage: Identifiable, Equatable {
     let id: UUID
     let role: Role
     var content: String
+    var attachments: [ChatAttachment]
 
-    init(id: UUID = UUID(), role: Role, content: String) {
+    init(id: UUID = UUID(), role: Role, content: String, attachments: [ChatAttachment] = []) {
         self.id = id
         self.role = role
         self.content = content
+        self.attachments = attachments
     }
 }
 
 struct QueuedPrompt: Identifiable, Equatable {
     let id: UUID
     let content: String
+    let attachments: [ChatAttachment]
 
-    init(id: UUID = UUID(), content: String) {
+    init(id: UUID = UUID(), content: String, attachments: [ChatAttachment] = []) {
         self.id = id
         self.content = content
+        self.attachments = attachments
+    }
+}
+
+struct ChatAttachment: Identifiable, Codable, Equatable {
+    let id: UUID
+    let filename: String
+    let mimeType: String
+    let dataBase64: String
+
+    init(id: UUID = UUID(), filename: String, mimeType: String, data: Data) {
+        self.id = id
+        self.filename = filename
+        self.mimeType = mimeType
+        self.dataBase64 = data.base64EncodedString()
+    }
+
+    var data: Data? {
+        Data(base64Encoded: dataBase64)
+    }
+
+    var image: NSImage? {
+        guard let data else { return nil }
+        return NSImage(data: data)
+    }
+
+    var fileExtension: String {
+        let explicit = URL(fileURLWithPath: filename).pathExtension
+        if !explicit.isEmpty {
+            return explicit
+        }
+        if let preferred = UTType(mimeType: mimeType)?.preferredFilenameExtension {
+            return preferred
+        }
+        return "png"
+    }
+
+    var summaryLabel: String {
+        filename.isEmpty ? "image" : filename
+    }
+
+    static func attachments(from pasteboard: NSPasteboard = .general) -> [ChatAttachment] {
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            let attachments = urls.compactMap(Self.fromFileURL(_:))
+            if !attachments.isEmpty {
+                return attachments
+            }
+        }
+
+        if let pngData = pasteboard.data(forType: .png),
+           let attachment = Self.makeAttachment(data: pngData, filename: "pasted-image.png", mimeType: "image/png") {
+            return [attachment]
+        }
+
+        if let tiffData = pasteboard.data(forType: .tiff),
+           let image = NSImage(data: tiffData),
+           let pngData = pngData(from: image),
+           let attachment = Self.makeAttachment(data: pngData, filename: "pasted-image.png", mimeType: "image/png") {
+            return [attachment]
+        }
+
+        return []
+    }
+
+    private static func fromFileURL(_ url: URL) -> ChatAttachment? {
+        guard url.isFileURL else { return nil }
+        guard let type = UTType(filenameExtension: url.pathExtension), type.conforms(to: .image) else {
+            return nil
+        }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let mimeType = type.preferredMIMEType ?? "image/png"
+        return Self.makeAttachment(data: data, filename: url.lastPathComponent, mimeType: mimeType)
+    }
+
+    private static func pngData(from image: NSImage) -> Data? {
+        guard let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData) else {
+            return nil
+        }
+        return bitmap.representation(using: .png, properties: [:])
+    }
+
+    private static func makeAttachment(data: Data, filename: String, mimeType: String) -> ChatAttachment? {
+        guard !data.isEmpty else { return nil }
+        return ChatAttachment(filename: filename, mimeType: mimeType, data: data)
     }
 }
 
@@ -120,6 +209,7 @@ struct QuickAskHistoryEnvelope: Codable {
 struct QuickAskTranscriptMessage: Codable, Equatable {
     let role: String
     let content: String
+    let attachments: [ChatAttachment]?
 }
 
 struct QuickAskLoadedSession: Codable {
@@ -514,14 +604,20 @@ protocol QuickAskLayoutDelegate: AnyObject {
 
 @MainActor
 final class QuickAskViewModel: ObservableObject {
-    private struct FailedTurnRetryContext {
+    private struct ChatTurnInput: Equatable {
         let prompt: String
+        let attachments: [ChatAttachment]
+    }
+
+    private struct FailedTurnRetryContext {
+        let input: ChatTurnInput
         let messagesBeforeTurn: [ChatMessage]
     }
 
     @Published var messages: [ChatMessage] = []
     @Published var queuedPrompts: [QueuedPrompt] = []
     @Published var inputText = ""
+    @Published var pendingAttachments: [ChatAttachment] = []
     @Published var inputBarFrame: CGRect = .zero
     @Published var historyAreaHeight: CGFloat = 0
     @Published var models: [ModelOption] = []
@@ -555,7 +651,7 @@ final class QuickAskViewModel: ObservableObject {
     private var pendingResetPreserveInput = false
     private var pendingSteerPromptID: UUID?
     private var currentTurnStreamedAny = false
-    private var activePromptText: String?
+    private var activeTurnInput: ChatTurnInput?
     private var messagesBeforeActiveTurn: [ChatMessage] = []
     private var lastFailedTurn: FailedTurnRetryContext?
     private var lastKnownNetworkOnline: Bool?
@@ -751,6 +847,7 @@ final class QuickAskViewModel: ObservableObject {
         clearRetryContext()
         if !preserveInput {
             inputText = ""
+            pendingAttachments = []
         }
         if !preserveStatus {
             statusText = ""
@@ -766,6 +863,7 @@ final class QuickAskViewModel: ObservableObject {
         sessionCreatedAt = session.createdAt
         statusText = ""
         inputText = ""
+        pendingAttachments = []
         queuedPrompts = []
         isGenerating = false
         activeAssistantMessageID = nil
@@ -778,8 +876,13 @@ final class QuickAskViewModel: ObservableObject {
             let role = message.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard role == "user" || role == "assistant" else { return nil }
             let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !content.isEmpty else { return nil }
-            return ChatMessage(role: role == "user" ? .user : .assistant, content: content)
+            let attachments = message.attachments ?? []
+            guard !content.isEmpty || !attachments.isEmpty else { return nil }
+            return ChatMessage(
+                role: role == "user" ? .user : .assistant,
+                content: content,
+                attachments: attachments
+            )
         }
 
         messages = restoredMessages
@@ -805,6 +908,7 @@ final class QuickAskViewModel: ObservableObject {
 
         if isAlreadyFreshChat {
             inputText = ""
+            pendingAttachments = []
             layoutDelegate?.quickAskNeedsLayout()
             requestFocus()
             return
@@ -815,32 +919,34 @@ final class QuickAskViewModel: ObservableObject {
     }
 
     func send() {
-        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard let draft = currentDraftInput() else { return }
+        guard validateSelectedModelForAttachments(draft.attachments) else { return }
 
         touch()
         inputText = ""
+        pendingAttachments = []
         if isGenerating {
-            queuedPrompts.append(QueuedPrompt(content: trimmed))
+            queuedPrompts.append(QueuedPrompt(content: draft.prompt, attachments: draft.attachments))
             layoutDelegate?.quickAskNeedsLayout()
             requestFocus()
             return
         }
 
-        startGeneration(for: trimmed)
+        startGeneration(for: draft)
     }
 
     func steerCurrentInput() {
-        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
+        guard let draft = currentDraftInput() else {
             steerQueuedPrompt(id: queuedPrompts.first?.id)
             return
         }
+        guard validateSelectedModelForAttachments(draft.attachments) else { return }
 
         touch()
         inputText = ""
+        pendingAttachments = []
         if isGenerating {
-            let queuedPrompt = QueuedPrompt(content: trimmed)
+            let queuedPrompt = QueuedPrompt(content: draft.prompt, attachments: draft.attachments)
             queuedPrompts.insert(queuedPrompt, at: 0)
             layoutDelegate?.quickAskNeedsLayout()
             pendingSteerPromptID = queuedPrompt.id
@@ -848,7 +954,7 @@ final class QuickAskViewModel: ObservableObject {
             return
         }
 
-        startGeneration(for: trimmed)
+        startGeneration(for: draft)
     }
 
     func steerQueuedPrompt(id: UUID?) {
@@ -886,13 +992,66 @@ final class QuickAskViewModel: ObservableObject {
         saveTranscript()
     }
 
-    private func startGeneration(for prompt: String) {
+    func addPendingAttachments(_ attachments: [ChatAttachment]) {
+        guard !attachments.isEmpty else { return }
+        pendingAttachments.append(contentsOf: attachments)
+        touch()
+        layoutDelegate?.quickAskNeedsLayout()
+        requestFocus()
+    }
+
+    func removePendingAttachment(id: ChatAttachment.ID) {
+        pendingAttachments.removeAll { $0.id == id }
+        touch()
+        layoutDelegate?.quickAskNeedsLayout()
+        requestFocus()
+    }
+
+    private func currentDraftInput() -> ChatTurnInput? {
+        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty || !pendingAttachments.isEmpty else { return nil }
+        return ChatTurnInput(prompt: trimmed, attachments: pendingAttachments)
+    }
+
+    private func validateSelectedModelForAttachments(_ attachments: [ChatAttachment]) -> Bool {
+        guard !attachments.isEmpty else { return true }
+        guard modelSupportsAttachments(modelID: selectedModelID) else {
+            let modelLabel = models.first(where: { $0.id == selectedModelID })?.shortLabel ?? "This model"
+            statusText = "\(modelLabel) does not support pasted images in Quick Ask yet. Switch to ChatGPT/Codex or an Ollama model and try again."
+            layoutDelegate?.quickAskNeedsLayout()
+            requestFocus()
+            return false
+        }
+        return true
+    }
+
+    private func modelSupportsAttachments(modelID: String) -> Bool {
+        guard let provider = modelID.components(separatedBy: "::").first else {
+            return false
+        }
+        return provider == "codex" || provider == "ollama"
+    }
+
+    private func serializedMessagePayload(from message: ChatMessage) -> [String: Any] {
+        var payload: [String: Any] = [
+            "role": message.role.rawValue,
+            "content": message.content,
+        ]
+        if !message.attachments.isEmpty,
+           let encoded = try? JSONEncoder().encode(message.attachments),
+           let object = try? JSONSerialization.jsonObject(with: encoded) as? [[String: Any]] {
+            payload["attachments"] = object
+        }
+        return payload
+    }
+
+    private func startGeneration(for input: ChatTurnInput) {
         statusText = ""
         currentTurnStreamedAny = false
         lastFailedTurn = nil
         messagesBeforeActiveTurn = messages
-        activePromptText = prompt
-        messages.append(ChatMessage(role: .user, content: prompt))
+        activeTurnInput = input
+        messages.append(ChatMessage(role: .user, content: input.prompt, attachments: input.attachments))
         let assistantID = UUID()
         activeAssistantMessageID = assistantID
         messages.append(ChatMessage(id: assistantID, role: .assistant, content: ""))
@@ -928,7 +1087,7 @@ final class QuickAskViewModel: ObservableObject {
                 }
                 return true
             }
-            .map { ["role": $0.role.rawValue, "content": $0.content] }
+            .map { self.serializedMessagePayload(from: $0) }
 
         stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
             guard let self else { return }
@@ -977,8 +1136,8 @@ final class QuickAskViewModel: ObservableObject {
             stderr.fileHandleForReading.readabilityHandler = nil
             activeProcess = nil
             isGenerating = false
-            lastFailedTurn = FailedTurnRetryContext(prompt: prompt, messagesBeforeTurn: messagesBeforeActiveTurn)
-            activePromptText = nil
+            lastFailedTurn = FailedTurnRetryContext(input: input, messagesBeforeTurn: messagesBeforeActiveTurn)
+            activeTurnInput = nil
             messagesBeforeActiveTurn = []
             statusText = "Could not start backend."
             trimEmptyAssistantMessage()
@@ -989,14 +1148,14 @@ final class QuickAskViewModel: ObservableObject {
     private func sendNextQueuedPrompt() {
         guard !isGenerating, let next = queuedPrompts.first else { return }
         queuedPrompts.removeFirst()
-        startGeneration(for: next.content)
+        startGeneration(for: ChatTurnInput(prompt: next.content, attachments: next.attachments))
         requestFocus()
     }
 
     private func sendQueuedPrompt(id: UUID) {
         guard !isGenerating, let index = queuedPrompts.firstIndex(where: { $0.id == id }) else { return }
         let prompt = queuedPrompts.remove(at: index)
-        startGeneration(for: prompt.content)
+        startGeneration(for: ChatTurnInput(prompt: prompt.content, attachments: prompt.attachments))
         requestFocus()
     }
 
@@ -1072,7 +1231,7 @@ final class QuickAskViewModel: ObservableObject {
 
     private func finishGeneration(exitCode: Int32) {
         let interruptedForSteer = pendingSteerPromptID != nil
-        let failedTurnPrompt = activePromptText
+        let failedTurnInput = activeTurnInput
         let messagesBeforeTurn = messagesBeforeActiveTurn
         isGenerating = false
         activeProcess = nil
@@ -1098,13 +1257,14 @@ final class QuickAskViewModel: ObservableObject {
             messages.remove(at: index)
         }
 
-        if exitCode != 0 && !interruptedForSteer, let failedTurnPrompt, !failedTurnPrompt.isEmpty {
-            lastFailedTurn = FailedTurnRetryContext(prompt: failedTurnPrompt, messagesBeforeTurn: messagesBeforeTurn)
+        if exitCode != 0 && !interruptedForSteer, let failedTurnInput,
+           !failedTurnInput.prompt.isEmpty || !failedTurnInput.attachments.isEmpty {
+            lastFailedTurn = FailedTurnRetryContext(input: failedTurnInput, messagesBeforeTurn: messagesBeforeTurn)
         } else if exitCode == 0 {
             lastFailedTurn = nil
         }
 
-        activePromptText = nil
+        activeTurnInput = nil
         messagesBeforeActiveTurn = []
         activeAssistantMessageID = nil
         saveTranscript()
@@ -1190,12 +1350,12 @@ final class QuickAskViewModel: ObservableObject {
         activeAssistantMessageID = nil
         messages = lastFailedTurn.messagesBeforeTurn
         layoutDelegate?.quickAskNeedsLayout()
-        startGeneration(for: lastFailedTurn.prompt)
+        startGeneration(for: lastFailedTurn.input)
     }
 
     private func clearRetryContext() {
         lastFailedTurn = nil
-        activePromptText = nil
+        activeTurnInput = nil
         messagesBeforeActiveTurn = []
     }
 
@@ -1215,7 +1375,7 @@ final class QuickAskViewModel: ObservableObject {
 
     private func saveTranscript() {
         guard !messages.isEmpty else { return }
-        let history = messages.map { ["role": $0.role.rawValue, "content": $0.content] }
+        let history = messages.map { self.serializedMessagePayload(from: $0) }
         let backendPath = self.backendPath
         let sessionID = self.sessionID
         let sessionCreatedAt = self.sessionCreatedAt
@@ -2070,41 +2230,115 @@ struct MessageBubble: View {
     var body: some View {
         HStack {
             if message.role == .user { Spacer(minLength: 40) }
-            MessageContentView(text: message.content.isEmpty ? "…" : message.content)
-                .foregroundStyle(textColor)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .padding(.trailing, canCopy ? 24 : 10)
-                .frame(maxWidth: 360, alignment: .leading)
-                .background(
-                    Rectangle()
-                        .fill(bubbleColor)
-                )
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.black.opacity(0.18), lineWidth: 1)
-                )
-                .overlay(alignment: .topTrailing) {
-                    if canCopy {
-                        Button(action: copyMessage) {
-                            Image(systemName: justCopied ? "checkmark" : "doc.on.doc")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(QuickAskTheme.strongText.opacity(0.78))
-                                .frame(width: 18, height: 18)
-                                .background(Rectangle().fill(Color.white.opacity(0.18)))
-                                .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
-                        }
-                        .buttonStyle(.plain)
-                        .opacity(isHovering || justCopied ? 1 : 0)
-                        .padding(5)
+            VStack(alignment: .leading, spacing: 8) {
+                if !message.attachments.isEmpty {
+                    AttachmentStripView(attachments: message.attachments)
+                }
+                if !message.content.isEmpty || message.attachments.isEmpty {
+                    MessageContentView(text: message.content.isEmpty ? "…" : message.content)
+                        .foregroundStyle(textColor)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .padding(.trailing, canCopy ? 24 : 10)
+            .frame(maxWidth: 360, alignment: .leading)
+            .background(
+                Rectangle()
+                    .fill(bubbleColor)
+            )
+            .overlay(
+                Rectangle()
+                    .stroke(Color.black.opacity(0.18), lineWidth: 1)
+            )
+            .overlay(alignment: .topTrailing) {
+                if canCopy {
+                    Button(action: copyMessage) {
+                        Image(systemName: justCopied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(QuickAskTheme.strongText.opacity(0.78))
+                            .frame(width: 18, height: 18)
+                            .background(Rectangle().fill(Color.white.opacity(0.18)))
+                            .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
                     }
+                    .buttonStyle(.plain)
+                    .opacity(isHovering || justCopied ? 1 : 0)
+                    .padding(5)
                 }
-                .onHover { hovering in
-                    isHovering = hovering
-                }
+            }
+            .onHover { hovering in
+                isHovering = hovering
+            }
             if message.role == .assistant { Spacer(minLength: 40) }
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+private struct AttachmentTileView: View {
+    let attachment: ChatAttachment
+    var onRemove: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ZStack(alignment: .topTrailing) {
+                Group {
+                    if let image = attachment.image {
+                        Image(nsImage: image)
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.18))
+                            .overlay(
+                                Image(systemName: "photo")
+                                    .font(.system(size: 18, weight: .medium))
+                                    .foregroundStyle(QuickAskTheme.mutedText)
+                            )
+                    }
+                }
+                .frame(width: 92, height: 72)
+                .clipped()
+                .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
+
+                if let onRemove {
+                    Button(action: onRemove) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.black.opacity(0.7))
+                            .background(Circle().fill(Color.white.opacity(0.8)))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(4)
+                }
+            }
+
+            Text(attachment.summaryLabel)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(QuickAskTheme.mutedText)
+                .lineLimit(1)
+                .frame(width: 92, alignment: .leading)
+        }
+    }
+}
+
+private struct AttachmentStripView: View {
+    let attachments: [ChatAttachment]
+    var removable = false
+    var onRemove: ((ChatAttachment.ID) -> Void)? = nil
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { attachment in
+                    AttachmentTileView(
+                        attachment: attachment,
+                        onRemove: removable ? { onRemove?(attachment.id) } : nil
+                    )
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -2316,13 +2550,38 @@ struct QueuedPromptRow: View {
     let onSteer: () -> Void
     let onCancel: () -> Void
 
+    private var promptLabel: String {
+        let trimmed = prompt.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+        let count = prompt.attachments.count
+        return count == 1 ? "1 image" : "\(count) images"
+    }
+
+    private var attachmentLabel: String? {
+        guard !prompt.attachments.isEmpty, !prompt.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        let count = prompt.attachments.count
+        return count == 1 ? "1 image attached" : "\(count) images attached"
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            Text(prompt.content)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(QuickAskTheme.strongText)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(promptLabel)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(QuickAskTheme.strongText)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let attachmentLabel {
+                    Text(attachmentLabel)
+                        .font(.system(size: 10, weight: .regular))
+                        .foregroundStyle(QuickAskTheme.mutedText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
 
             Button(action: onSteer) {
                 Text("Steer")
@@ -2357,6 +2616,7 @@ struct SuggestionFreeInputField: NSViewRepresentable {
     let onSubmit: () -> Void
     let onSteerSubmit: () -> Void
     let onTextChange: () -> Void
+    let onImagePaste: ([ChatAttachment]) -> Void
 
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: SuggestionFreeInputField
@@ -2461,6 +2721,7 @@ struct SuggestionFreeInputField: NSViewRepresentable {
     func makeNSView(context: Context) -> NSTextField {
         let field = SuggestionFreeTextField(string: text)
         field.delegate = context.coordinator
+        field.onImagePaste = onImagePaste
         field.placeholderAttributedString = NSAttributedString(
             string: placeholder,
             attributes: [
@@ -2486,12 +2747,26 @@ struct SuggestionFreeInputField: NSViewRepresentable {
         if field.stringValue != text {
             field.stringValue = text
         }
+        if let field = field as? SuggestionFreeTextField {
+            field.onImagePaste = onImagePaste
+        }
         context.coordinator.requestFocus(for: field, token: focusToken)
     }
 }
 
 final class SuggestionFreeTextField: NSTextField {
+    var onImagePaste: (([ChatAttachment]) -> Void)?
+
     override func complete(_ sender: Any?) {}
+
+    @IBAction func paste(_ sender: Any?) {
+        let attachments = ChatAttachment.attachments()
+        if !attachments.isEmpty {
+            onImagePaste?(attachments)
+            return
+        }
+        currentEditor()?.paste(sender)
+    }
 }
 
 struct QuickAskView: View {
@@ -2577,6 +2852,21 @@ struct QuickAskView: View {
             }
 
             VStack(spacing: 0) {
+                if !viewModel.pendingAttachments.isEmpty {
+                    AttachmentStripView(
+                        attachments: viewModel.pendingAttachments,
+                        removable: true,
+                        onRemove: { id in
+                            viewModel.removePendingAttachment(id: id)
+                        }
+                    )
+                    .padding(.horizontal, 10)
+                    .padding(.top, 10)
+                    .padding(.bottom, 6)
+                    .background(QuickAskTheme.inputBackground)
+                    .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
+                }
+
                 HStack(spacing: 8) {
                     Menu {
                         ForEach(viewModel.models) { model in
@@ -2634,6 +2924,9 @@ struct QuickAskView: View {
                         },
                         onTextChange: {
                             viewModel.touch()
+                        },
+                        onImagePaste: { attachments in
+                            viewModel.addPendingAttachments(attachments)
                         }
                     )
                 }
@@ -3043,6 +3336,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
                (event.keyCode == UInt16(kVK_Return) || event.keyCode == UInt16(kVK_ANSI_KeypadEnter)) {
                 self.viewModel.steerCurrentInput()
                 return nil
+            }
+            if self.panel.isVisible,
+               self.panel.isKeyWindow,
+               self.panelInputIsFocused(),
+               flags == [.command],
+               event.charactersIgnoringModifiers?.lowercased() == "v" {
+                let attachments = ChatAttachment.attachments()
+                if !attachments.isEmpty {
+                    self.viewModel.addPendingAttachments(attachments)
+                    return nil
+                }
             }
             if self.panel.isVisible,
                self.panel.isKeyWindow,

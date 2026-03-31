@@ -4,17 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import functools
 import http.client
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -120,6 +123,19 @@ FRIENDLY_OLLAMA_NAMES = {
     "qwen3:30b": "Qwen 3 30B",
     "richardyoung/qwen3-14b-abliterated:Q4_K_M": "Qwen 3 Ablit",
 }
+
+IMAGE_MIME_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/tiff": ".tiff",
+}
+
+HistoryMessage = dict[str, Any]
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -513,7 +529,53 @@ def ollama_provider_status() -> dict[str, Any]:
     }
 
 
-def build_prompt(history: list[dict[str, str]]) -> str:
+def message_attachments(message: HistoryMessage) -> list[dict[str, str]]:
+    raw = message.get("attachments")
+    if not isinstance(raw, list):
+        return []
+
+    cleaned: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        filename = str(item.get("filename") or "image").strip() or "image"
+        mime_type = str(item.get("mimeType") or item.get("mime_type") or "image/png").strip() or "image/png"
+        data_base64 = str(item.get("dataBase64") or item.get("data_base64") or "").strip()
+        if not data_base64:
+            continue
+        cleaned.append(
+            {
+                "filename": filename,
+                "mime_type": mime_type,
+                "data_base64": data_base64,
+            }
+        )
+    return cleaned
+
+
+def history_contains_attachments(history: list[HistoryMessage]) -> bool:
+    return any(message_attachments(message) for message in history)
+
+
+def attachment_count_label(count: int) -> str:
+    return "1 image" if count == 1 else f"{count} images"
+
+
+def attachment_prompt_text(attachments: list[dict[str, str]], start_index: int) -> tuple[str, int]:
+    labels: list[str] = []
+    next_index = start_index
+    for attachment in attachments:
+        filename = attachment.get("filename") or f"image-{next_index}"
+        labels.append(f"image #{next_index} ({filename})")
+        next_index += 1
+    if not labels:
+        return "", start_index
+    if len(labels) == 1:
+        return f"Attached {labels[0]}.", next_index
+    return f"Attached images: {', '.join(labels)}.", next_index
+
+
+def build_prompt(history: list[HistoryMessage]) -> str:
     if not history:
         return "The user has not said anything yet."
 
@@ -522,18 +584,25 @@ def build_prompt(history: list[dict[str, str]]) -> str:
         "",
         "Conversation:",
     ]
+    image_index = 1
     for message in history:
         role = str(message.get("role") or "").strip().lower()
         content = str(message.get("content") or "").strip()
-        if role not in {"user", "assistant"} or not content:
+        attachments = message_attachments(message)
+        if role not in {"user", "assistant"} or (not content and not attachments):
             continue
         prefix = "User" if role == "user" else "Assistant"
-        lines.append(f"{prefix}: {content}")
+        if attachments:
+            attachment_text, image_index = attachment_prompt_text(attachments, image_index)
+            if attachment_text:
+                lines.append(f"{prefix}: {attachment_text}")
+        if content:
+            lines.append(f"{prefix}: {content}")
     lines.extend(["", "Assistant:"])
     return "\n".join(lines)
 
 
-def build_remote_cli_prompt(history: list[dict[str, str]]) -> str:
+def build_remote_cli_prompt(history: list[HistoryMessage]) -> str:
     return (
         f"System:\n{QUICK_SYSTEM_PROMPT}\n\n"
         f"{build_prompt(history)}"
@@ -551,7 +620,7 @@ def history_disabled() -> bool:
     return os.environ.get("QUICK_ASK_DISABLE_HISTORY", "").strip() == "1"
 
 
-def session_preview(messages: list[dict[str, str]]) -> str:
+def session_preview(messages: list[HistoryMessage]) -> str:
     for message in reversed(messages):
         role = str(message.get("role") or "").strip().lower()
         if role == "system":
@@ -559,6 +628,9 @@ def session_preview(messages: list[dict[str, str]]) -> str:
         content = str(message.get("content") or "").strip()
         if content:
             return compact_preview(content)
+        attachments = message_attachments(message)
+        if attachments:
+            return attachment_count_label(len(attachments))
     return ""
 
 
@@ -569,7 +641,7 @@ def subscription_only_env() -> dict[str, str]:
     return env
 
 
-def claude_shell_invocation(model: str, history: list[dict[str, str]]) -> tuple[list[str], pathlib.Path]:
+def claude_shell_invocation(model: str, history: list[HistoryMessage]) -> tuple[list[str], pathlib.Path]:
     prompt = build_prompt(history)
     claude_path = pathlib.Path(command_path("claude") or pathlib.Path.home() / ".local/bin/claude")
     SAFE_CWD.mkdir(parents=True, exist_ok=True)
@@ -603,7 +675,7 @@ def claude_shell_invocation(model: str, history: list[dict[str, str]]) -> tuple[
     return ["/bin/zsh", "-lc", " ".join(shlex.quote(part) for part in argv)], SAFE_CWD
 
 
-def stream_claude(model: str, history: list[dict[str, str]]) -> int:
+def stream_claude(model: str, history: list[HistoryMessage]) -> int:
     command, safe_cwd = claude_shell_invocation(model, history)
     proc = subprocess.Popen(
         command,
@@ -665,7 +737,46 @@ def stream_claude(model: str, history: list[dict[str, str]]) -> int:
     return 0
 
 
-def codex_shell_invocation(model: str, history: list[dict[str, str]]) -> tuple[list[str], pathlib.Path]:
+def attachment_file_suffix(attachment: dict[str, str]) -> str:
+    filename = attachment.get("filename") or ""
+    suffix = pathlib.Path(filename).suffix
+    if suffix:
+        return suffix
+    return IMAGE_MIME_EXTENSIONS.get(attachment.get("mime_type") or "", ".png")
+
+
+def safe_attachment_stem(filename: str, fallback: str) -> str:
+    stem = pathlib.Path(filename).stem.strip() or fallback
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-")
+    return sanitized or fallback
+
+
+def materialize_attachment_files(history: list[HistoryMessage], target_dir: pathlib.Path) -> list[pathlib.Path]:
+    paths: list[pathlib.Path] = []
+    target_dir.mkdir(parents=True, exist_ok=True)
+    counter = 1
+    for message in history:
+        for attachment in message_attachments(message):
+            try:
+                data = base64.b64decode(attachment["data_base64"], validate=True)
+            except Exception:
+                continue
+            if not data:
+                continue
+            stem = safe_attachment_stem(attachment.get("filename") or "", f"image-{counter}")
+            suffix = attachment_file_suffix(attachment)
+            path = target_dir / f"{counter:03d}-{stem}{suffix}"
+            path.write_bytes(data)
+            paths.append(path)
+            counter += 1
+    return paths
+
+
+def codex_shell_invocation(
+    model: str,
+    history: list[HistoryMessage],
+    attachment_dir: pathlib.Path | None = None,
+) -> tuple[list[str], pathlib.Path]:
     prompt = build_remote_cli_prompt(history)
     codex_path = command_path("codex")
     if not codex_path:
@@ -684,25 +795,36 @@ def codex_shell_invocation(model: str, history: list[dict[str, str]]) -> tuple[l
         model,
         prompt,
     ]
+    if attachment_dir is not None:
+        for path in materialize_attachment_files(history, attachment_dir):
+            argv.extend(["-i", str(path)])
     return argv, SAFE_CWD
 
 
-def stream_codex(model: str, history: list[dict[str, str]]) -> int:
-    command, safe_cwd = codex_shell_invocation(model, history)
-    proc = subprocess.Popen(
-        command,
-        cwd=str(safe_cwd),
-        env=provider_runtime_env("codex"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
-
-    assert proc.stdout is not None
-    streamed_any = False
+def stream_codex(model: str, history: list[HistoryMessage]) -> int:
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    proc: subprocess.Popen[str] | None = None
+    SAFE_CWD.mkdir(parents=True, exist_ok=True)
     try:
+        attachment_dir = None
+        if history_contains_attachments(history):
+            temp_dir = tempfile.TemporaryDirectory(prefix="quick-ask-codex-images-", dir=SAFE_CWD)
+            attachment_dir = pathlib.Path(temp_dir.name)
+
+        command, safe_cwd = codex_shell_invocation(model, history, attachment_dir=attachment_dir)
+        proc = subprocess.Popen(
+            command,
+            cwd=str(safe_cwd),
+            env=provider_runtime_env("codex"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
+        assert proc.stdout is not None
+        streamed_any = False
         for raw_line in proc.stdout:
             line = raw_line.strip()
             if not line or not line.startswith("{"):
@@ -724,12 +846,19 @@ def stream_codex(model: str, history: list[dict[str, str]]) -> int:
                 emit({"type": "done"})
                 return 0
     except KeyboardInterrupt:
-        proc.kill()
+        if proc is not None:
+            proc.kill()
         raise
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
     stderr = ""
-    if proc.stderr is not None:
+    if proc is not None and proc.stderr is not None:
         stderr = proc.stderr.read().strip()
+    if proc is None:
+        emit({"type": "error", "message": "Codex could not start."})
+        return 1
     proc.wait()
     if proc.returncode != 0:
         emit({"type": "error", "message": stderr or f"Codex exited with status {proc.returncode}."})
@@ -741,7 +870,7 @@ def stream_codex(model: str, history: list[dict[str, str]]) -> int:
     return 0
 
 
-def gemini_shell_invocation(model: str, history: list[dict[str, str]]) -> tuple[list[str], pathlib.Path]:
+def gemini_shell_invocation(model: str, history: list[HistoryMessage]) -> tuple[list[str], pathlib.Path]:
     prompt = build_remote_cli_prompt(history)
     gemini_path = command_path("gemini")
     if not gemini_path:
@@ -761,7 +890,7 @@ def gemini_shell_invocation(model: str, history: list[dict[str, str]]) -> tuple[
     return argv, SAFE_CWD
 
 
-def stream_gemini(model: str, history: list[dict[str, str]]) -> int:
+def stream_gemini(model: str, history: list[HistoryMessage]) -> int:
     command, safe_cwd = gemini_shell_invocation(model, history)
     proc = subprocess.Popen(
         command,
@@ -823,14 +952,18 @@ def stream_gemini(model: str, history: list[dict[str, str]]) -> int:
     return 0
 
 
-def ollama_messages_from_history(history: list[dict[str, str]]) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = [{"role": "system", "content": QUICK_SYSTEM_PROMPT}]
+def ollama_messages_from_history(history: list[HistoryMessage]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = [{"role": "system", "content": QUICK_SYSTEM_PROMPT}]
     for message in history:
         role = str(message.get("role") or "").strip().lower()
         content = str(message.get("content") or "").strip()
-        if role not in {"user", "assistant"} or not content:
+        attachments = [attachment["data_base64"] for attachment in message_attachments(message)]
+        if role not in {"user", "assistant"} or (not content and not attachments):
             continue
-        messages.append({"role": role, "content": content})
+        payload: dict[str, Any] = {"role": role, "content": content}
+        if attachments and role == "user":
+            payload["images"] = attachments
+        messages.append(payload)
     return messages
 
 
@@ -839,7 +972,7 @@ def open_ollama_connection(base_url: str) -> http.client.HTTPConnection:
     return conn
 
 
-def stream_ollama_once(endpoint: dict[str, str], model: str, history: list[dict[str, str]]) -> tuple[int, bool]:
+def stream_ollama_once(endpoint: dict[str, str], model: str, history: list[HistoryMessage]) -> tuple[int, bool]:
     body = json.dumps(
         {
             "model": model,
@@ -890,7 +1023,7 @@ def stream_ollama_once(endpoint: dict[str, str], model: str, history: list[dict[
     return 0, streamed_any
 
 
-def stream_ollama(model: str, history: list[dict[str, str]]) -> int:
+def stream_ollama(model: str, history: list[HistoryMessage]) -> int:
     endpoint = shared.resolve_ollama_endpoint(ensure_local=True, prefer_env=False)
     try:
         code, streamed_any = stream_ollama_once(endpoint, model, history)
@@ -909,7 +1042,7 @@ def stream_ollama(model: str, history: list[dict[str, str]]) -> int:
         return 1
 
 
-def read_history_from_stdin() -> list[dict[str, str]]:
+def read_history_from_stdin() -> list[HistoryMessage]:
     raw = sys.stdin.read().strip()
     if not raw:
         return []
@@ -917,15 +1050,19 @@ def read_history_from_stdin() -> list[dict[str, str]]:
     history = payload.get("history", payload)
     if not isinstance(history, list):
         raise RuntimeError("Expected a history array on stdin.")
-    cleaned: list[dict[str, str]] = []
+    cleaned: list[HistoryMessage] = []
     for item in history:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
         content = str(item.get("content") or "").strip()
-        if role not in {"user", "assistant"} or not content:
+        attachments = message_attachments(item)
+        if role not in {"user", "assistant"} or (not content and not attachments):
             continue
-        cleaned.append({"role": role, "content": content})
+        payload: HistoryMessage = {"role": role, "content": content}
+        if attachments:
+            payload["attachments"] = attachments
+        cleaned.append(payload)
     return cleaned
 
 
@@ -1019,6 +1156,18 @@ def handle_chat(model_id: str) -> int:
         return 1
 
     provider, model = model_id.split("::", 1)
+    if history_contains_attachments(history) and provider not in {"codex", "ollama"}:
+        provider_label = {
+            "claude": "Claude",
+            "gemini": "Gemini",
+        }.get(provider, provider.capitalize())
+        emit(
+            {
+                "type": "error",
+                "message": f"{provider_label} does not support pasted images in Quick Ask yet. Switch to ChatGPT/Codex or an Ollama model.",
+            }
+        )
+        return 1
     if provider == "claude":
         return stream_claude(model, history)
     if provider == "codex":
