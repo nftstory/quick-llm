@@ -1019,7 +1019,7 @@ final class QuickAskViewModel: ObservableObject {
         guard !attachments.isEmpty else { return true }
         guard modelSupportsAttachments(modelID: selectedModelID) else {
             let modelLabel = models.first(where: { $0.id == selectedModelID })?.shortLabel ?? "This model"
-            statusText = "\(modelLabel) does not support pasted images in Quick Ask yet. Switch to ChatGPT/Codex or an Ollama model and try again."
+            statusText = "\(modelLabel) does not support pasted images in Quick Ask yet."
             layoutDelegate?.quickAskNeedsLayout()
             requestFocus()
             return false
@@ -1031,7 +1031,7 @@ final class QuickAskViewModel: ObservableObject {
         guard let provider = modelID.components(separatedBy: "::").first else {
             return false
         }
-        return provider == "codex" || provider == "ollama"
+        return provider == "claude" || provider == "codex" || provider == "gemini" || provider == "ollama"
     }
 
     private func serializedMessagePayload(from message: ChatMessage) -> [String: Any] {

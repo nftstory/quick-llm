@@ -577,7 +577,10 @@ def attachment_prompt_text(attachments: list[dict[str, str]], start_index: int) 
     return f"Attached images: {', '.join(labels)}.", next_index
 
 
-def build_prompt(history: list[HistoryMessage]) -> str:
+def build_prompt(
+    history: list[HistoryMessage],
+    attachment_reference_groups: list[list[str]] | None = None,
+) -> str:
     if not history:
         return "The user has not said anything yet."
 
@@ -587,7 +590,7 @@ def build_prompt(history: list[HistoryMessage]) -> str:
         "Conversation:",
     ]
     image_index = 1
-    for message in history:
+    for index, message in enumerate(history):
         role = str(message.get("role") or "").strip().lower()
         content = str(message.get("content") or "").strip()
         attachments = message_attachments(message)
@@ -598,17 +601,56 @@ def build_prompt(history: list[HistoryMessage]) -> str:
             attachment_text, image_index = attachment_prompt_text(attachments, image_index)
             if attachment_text:
                 lines.append(f"{prefix}: {attachment_text}")
+            if attachment_reference_groups is not None and index < len(attachment_reference_groups):
+                for reference in attachment_reference_groups[index]:
+                    lines.append(f"{prefix}: Local image path: {reference}")
         if content:
             lines.append(f"{prefix}: {content}")
     lines.extend(["", "Assistant:"])
     return "\n".join(lines)
 
 
-def build_remote_cli_prompt(history: list[HistoryMessage]) -> str:
+def build_remote_cli_prompt(
+    history: list[HistoryMessage],
+    attachment_reference_groups: list[list[str]] | None = None,
+) -> str:
     return (
         f"System:\n{QUICK_SYSTEM_PROMPT}\n\n"
-        f"{build_prompt(history)}"
+        f"{build_prompt(history, attachment_reference_groups=attachment_reference_groups)}"
     )
+
+
+def build_gemini_prompt(history: list[HistoryMessage], attachment_reference_groups: list[list[str]] | None = None) -> str:
+    if not history:
+        return f"System:\n{QUICK_SYSTEM_PROMPT}\n\nThe user has not said anything yet."
+
+    lines: list[str] = [
+        f"System:\n{QUICK_SYSTEM_PROMPT}",
+        "",
+        "Continue this conversation naturally.",
+        "",
+        "Conversation:",
+    ]
+    image_index = 1
+    for index, message in enumerate(history):
+        role = str(message.get("role") or "").strip().lower()
+        content = str(message.get("content") or "").strip()
+        attachments = message_attachments(message)
+        if role not in {"user", "assistant"} or (not content and not attachments):
+            continue
+        prefix = "User" if role == "user" else "Assistant"
+        if attachments:
+            attachment_text, next_index = attachment_prompt_text(attachments, image_index)
+            if attachment_text:
+                lines.append(f"{prefix}: {attachment_text}")
+            if attachment_reference_groups is not None and index < len(attachment_reference_groups):
+                for reference in attachment_reference_groups[index]:
+                    lines.append(reference)
+            image_index = next_index
+        if content:
+            lines.append(f"{prefix}: {content}")
+    lines.extend(["", "Assistant:"])
+    return "\n".join(lines)
 
 
 def compact_preview(text: str, limit: int = 140) -> str:
@@ -643,8 +685,42 @@ def subscription_only_env() -> dict[str, str]:
     return env
 
 
-def claude_shell_invocation(model: str, history: list[HistoryMessage]) -> tuple[list[str], pathlib.Path]:
-    prompt = build_prompt(history)
+def materialize_attachment_file_groups(history: list[HistoryMessage], target_dir: pathlib.Path) -> list[list[pathlib.Path]]:
+    groups: list[list[pathlib.Path]] = []
+    target_dir.mkdir(parents=True, exist_ok=True)
+    counter = 1
+    for message in history:
+        paths: list[pathlib.Path] = []
+        for attachment in message_attachments(message):
+            try:
+                data = base64.b64decode(attachment["data_base64"], validate=True)
+            except Exception:
+                continue
+            if not data:
+                continue
+            stem = safe_attachment_stem(attachment.get("filename") or "", f"image-{counter}")
+            suffix = attachment_file_suffix(attachment)
+            path = target_dir / f"{counter:03d}-{stem}{suffix}"
+            path.write_bytes(data)
+            paths.append(path)
+            counter += 1
+        groups.append(paths)
+    return groups
+
+
+def claude_shell_invocation(
+    model: str,
+    history: list[HistoryMessage],
+    attachment_dir: pathlib.Path | None = None,
+) -> tuple[list[str], pathlib.Path]:
+    attachment_reference_groups: list[list[str]] | None = None
+    allow_read = history_contains_attachments(history) and attachment_dir is not None
+    if allow_read:
+        attachment_reference_groups = [
+            [str(path) for path in group]
+            for group in materialize_attachment_file_groups(history, attachment_dir)
+        ]
+    prompt = build_prompt(history, attachment_reference_groups=attachment_reference_groups)
     claude_path = pathlib.Path(command_path("claude") or pathlib.Path.home() / ".local/bin/claude")
     SAFE_CWD.mkdir(parents=True, exist_ok=True)
     argv = [
@@ -657,14 +733,12 @@ def claude_shell_invocation(model: str, history: list[HistoryMessage]) -> tuple[
         "low",
         "--no-session-persistence",
         "--permission-mode",
-        "dontAsk",
+        "default" if allow_read else "dontAsk",
         "--no-chrome",
         "--output-format",
         "stream-json",
         "--verbose",
         "--include-partial-messages",
-        "--tools",
-        "",
         "--disable-slash-commands",
         "--setting-sources",
         "user",
@@ -674,25 +748,37 @@ def claude_shell_invocation(model: str, history: list[HistoryMessage]) -> tuple[
         "--system-prompt",
         QUICK_SYSTEM_PROMPT,
     ]
-    return ["/bin/zsh", "-lc", " ".join(shlex.quote(part) for part in argv)], SAFE_CWD
+    if allow_read:
+        argv.extend(["--allowedTools", "Read"])
+    else:
+        argv.extend(["--tools", ""])
+    return argv, SAFE_CWD
 
 
 def stream_claude(model: str, history: list[HistoryMessage]) -> int:
-    command, safe_cwd = claude_shell_invocation(model, history)
-    proc = subprocess.Popen(
-        command,
-        cwd=str(safe_cwd),
-        env=provider_runtime_env("claude"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
-
-    assert proc.stdout is not None
-    streamed_any = False
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    proc: subprocess.Popen[str] | None = None
+    SAFE_CWD.mkdir(parents=True, exist_ok=True)
     try:
+        attachment_dir = None
+        if history_contains_attachments(history):
+            temp_dir = tempfile.TemporaryDirectory(prefix="quick-ask-claude-images-", dir=SAFE_CWD)
+            attachment_dir = pathlib.Path(temp_dir.name)
+
+        command, safe_cwd = claude_shell_invocation(model, history, attachment_dir=attachment_dir)
+        proc = subprocess.Popen(
+            command,
+            cwd=str(safe_cwd),
+            env=provider_runtime_env("claude"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
+        assert proc.stdout is not None
+        streamed_any = False
         for raw_line in proc.stdout:
             line = raw_line.strip()
             if not line:
@@ -725,12 +811,19 @@ def stream_claude(model: str, history: list[HistoryMessage]) -> int:
                 emit({"type": "done"})
                 return 0
     except KeyboardInterrupt:
-        proc.kill()
+        if proc is not None:
+            proc.kill()
         raise
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
     stderr = ""
-    if proc.stderr is not None:
+    if proc is not None and proc.stderr is not None:
         stderr = proc.stderr.read().strip()
+    if proc is None:
+        emit({"type": "error", "message": "Claude could not start."})
+        return 1
     proc.wait()
     if proc.returncode != 0:
         emit({"type": "error", "message": stderr or f"Claude exited with status {proc.returncode}."})
@@ -758,24 +851,7 @@ def safe_attachment_stem(filename: str, fallback: str) -> str:
 
 
 def materialize_attachment_files(history: list[HistoryMessage], target_dir: pathlib.Path) -> list[pathlib.Path]:
-    paths: list[pathlib.Path] = []
-    target_dir.mkdir(parents=True, exist_ok=True)
-    counter = 1
-    for message in history:
-        for attachment in message_attachments(message):
-            try:
-                data = base64.b64decode(attachment["data_base64"], validate=True)
-            except Exception:
-                continue
-            if not data:
-                continue
-            stem = safe_attachment_stem(attachment.get("filename") or "", f"image-{counter}")
-            suffix = attachment_file_suffix(attachment)
-            path = target_dir / f"{counter:03d}-{stem}{suffix}"
-            path.write_bytes(data)
-            paths.append(path)
-            counter += 1
-    return paths
+    return [path for group in materialize_attachment_file_groups(history, target_dir) for path in group]
 
 
 def codex_shell_invocation(
@@ -881,8 +957,24 @@ def stream_codex(model_id: str, history: list[HistoryMessage]) -> int:
     return 0
 
 
-def gemini_shell_invocation(model: str, history: list[HistoryMessage]) -> tuple[list[str], pathlib.Path]:
-    prompt = build_remote_cli_prompt(history)
+def gemini_shell_invocation(
+    model: str,
+    history: list[HistoryMessage],
+    attachment_dir: pathlib.Path | None = None,
+) -> tuple[list[str], pathlib.Path]:
+    attachment_reference_groups: list[list[str]] | None = None
+    if attachment_dir is not None and history_contains_attachments(history):
+        attachment_reference_groups = []
+        for group in materialize_attachment_file_groups(history, attachment_dir):
+            references: list[str] = []
+            for path in group:
+                try:
+                    relative = path.relative_to(SAFE_CWD)
+                except ValueError:
+                    relative = path
+                references.append(f"@{relative}")
+            attachment_reference_groups.append(references)
+    prompt = build_gemini_prompt(history, attachment_reference_groups=attachment_reference_groups)
     gemini_path = command_path("gemini")
     if not gemini_path:
         raise RuntimeError("Gemini CLI is not installed.")
@@ -902,21 +994,29 @@ def gemini_shell_invocation(model: str, history: list[HistoryMessage]) -> tuple[
 
 
 def stream_gemini(model: str, history: list[HistoryMessage]) -> int:
-    command, safe_cwd = gemini_shell_invocation(model, history)
-    proc = subprocess.Popen(
-        command,
-        cwd=str(safe_cwd),
-        env=provider_runtime_env("gemini", "node"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
-
-    assert proc.stdout is not None
-    streamed_any = False
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    proc: subprocess.Popen[str] | None = None
+    SAFE_CWD.mkdir(parents=True, exist_ok=True)
     try:
+        attachment_dir = None
+        if history_contains_attachments(history):
+            temp_dir = tempfile.TemporaryDirectory(prefix="quick-ask-gemini-images-", dir=SAFE_CWD)
+            attachment_dir = pathlib.Path(temp_dir.name)
+
+        command, safe_cwd = gemini_shell_invocation(model, history, attachment_dir=attachment_dir)
+        proc = subprocess.Popen(
+            command,
+            cwd=str(safe_cwd),
+            env=provider_runtime_env("gemini", "node"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
+        assert proc.stdout is not None
+        streamed_any = False
         for raw_line in proc.stdout:
             line = raw_line.strip()
             if not line or not line.startswith("{"):
@@ -946,12 +1046,19 @@ def stream_gemini(model: str, history: list[HistoryMessage]) -> int:
                 emit({"type": "done"})
                 return 0
     except KeyboardInterrupt:
-        proc.kill()
+        if proc is not None:
+            proc.kill()
         raise
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
     stderr = ""
-    if proc.stderr is not None:
+    if proc is not None and proc.stderr is not None:
         stderr = proc.stderr.read().strip()
+    if proc is None:
+        emit({"type": "error", "message": "Gemini could not start."})
+        return 1
     proc.wait()
     if proc.returncode != 0:
         emit({"type": "error", "message": stderr or f"Gemini exited with status {proc.returncode}."})
@@ -1167,18 +1274,6 @@ def handle_chat(model_id: str) -> int:
         return 1
 
     provider, model = model_id.split("::", 1)
-    if history_contains_attachments(history) and provider not in {"codex", "ollama"}:
-        provider_label = {
-            "claude": "Claude",
-            "gemini": "Gemini",
-        }.get(provider, provider.capitalize())
-        emit(
-            {
-                "type": "error",
-                "message": f"{provider_label} does not support pasted images in Quick Ask yet. Switch to ChatGPT/Codex or an Ollama model.",
-            }
-        )
-        return 1
     if provider == "claude":
         return stream_claude(model, history)
     if provider == "codex":

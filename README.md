@@ -20,7 +20,7 @@ The app lives above your other windows, keeps the input bar pinned while the con
 - Steer to the next queued prompt with `Cmd+Enter`
 - Cancel queued prompts without interrupting the current reply
 - Steer or remove each queued prompt individually
-- Paste images from the clipboard into the composer for supported models
+- Paste images from the clipboard into the composer
 - Restore earlier chats from encrypted saved history
 - Delete saved threads directly from the history window
 - Show a small setup screen only when history is enabled but no archive folder has been chosen yet
@@ -84,8 +84,8 @@ If at least one provider or local model is already available, Quick Ask does not
 
 Image support notes:
 
-- Pasted images are currently forwarded to ChatGPT/Codex and Ollama models.
-- Claude and Gemini stay available for text, but Quick Ask will ask you to switch models if you try to send pasted images through those providers.
+- Pasted images are forwarded to Claude, ChatGPT/Codex, Gemini, and Ollama models.
+- Quick Ask materializes pasted images as temporary local files for the CLI-backed providers that need file-path handoff.
 
 Model switching semantics:
 

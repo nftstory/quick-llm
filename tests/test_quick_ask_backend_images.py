@@ -107,7 +107,57 @@ class BackendImageSupportTests(unittest.TestCase):
                 self.assertTrue(image_path.exists())
                 self.assertEqual(image_path.read_bytes(), b"chart-bytes")
 
-    def test_handle_chat_rejects_images_for_unsupported_provider(self) -> None:
+    def test_claude_shell_invocation_allows_read_for_attachment_files(self) -> None:
+        history = [
+            {
+                "role": "user",
+                "content": "what is in this image?",
+                "attachments": [sample_attachment("receipt.png", b"receipt-bytes")],
+            }
+        ]
+        with tempfile.TemporaryDirectory(prefix="quick-ask-claude-test-") as temp_dir:
+            with mock.patch.object(backend, "SAFE_CWD", Path(temp_dir)):
+                with mock.patch.object(backend, "command_path", return_value="/opt/homebrew/bin/claude"):
+                    argv, _safe_cwd = backend.claude_shell_invocation(
+                        "claude-opus-4-6",
+                        history,
+                        attachment_dir=Path(temp_dir) / "attachments",
+                    )
+
+                    self.assertIn("--allowedTools", argv)
+                    self.assertIn("Read", argv)
+                    prompt = argv[argv.index("-p") + 1]
+                    self.assertIn("Local image path:", prompt)
+                    self.assertIn("receipt.png", prompt)
+                    materialized_path = Path(prompt.split("Local image path:", 1)[1].splitlines()[0].strip())
+                    self.assertTrue(materialized_path.exists())
+                    self.assertEqual(materialized_path.read_bytes(), b"receipt-bytes")
+
+    def test_gemini_shell_invocation_uses_workspace_relative_attachment_refs(self) -> None:
+        history = [
+            {
+                "role": "user",
+                "content": "describe this image",
+                "attachments": [sample_attachment("chart.png", b"chart-bytes")],
+            }
+        ]
+        with tempfile.TemporaryDirectory(prefix="quick-ask-gemini-test-") as temp_dir:
+            safe_cwd = Path(temp_dir)
+            attachment_dir = safe_cwd / "attachments"
+            with mock.patch.object(backend, "SAFE_CWD", safe_cwd):
+                with mock.patch.object(backend, "command_path", return_value="/opt/homebrew/bin/gemini"):
+                    argv, _safe_cwd = backend.gemini_shell_invocation(
+                        "gemini-2.5-flash-lite",
+                        history,
+                        attachment_dir=attachment_dir,
+                    )
+
+                    prompt = argv[argv.index("-p") + 1]
+                    self.assertIn("@attachments/001-chart.png", prompt)
+                    self.assertTrue((attachment_dir / "001-chart.png").exists())
+                    self.assertEqual((attachment_dir / "001-chart.png").read_bytes(), b"chart-bytes")
+
+    def test_handle_chat_routes_image_turns_to_claude(self) -> None:
         history = [
             {
                 "role": "user",
@@ -116,14 +166,26 @@ class BackendImageSupportTests(unittest.TestCase):
             }
         ]
         with mock.patch.object(backend, "read_history_from_stdin", return_value=history):
-            with mock.patch.object(backend, "emit") as emit:
+            with mock.patch.object(backend, "stream_claude", return_value=0) as stream_claude:
                 result = backend.handle_chat("claude::claude-opus-4-6")
 
-        self.assertEqual(result, 1)
-        emit.assert_called_once()
-        payload = emit.call_args.args[0]
-        self.assertEqual(payload["type"], "error")
-        self.assertIn("does not support pasted images", payload["message"])
+        self.assertEqual(result, 0)
+        stream_claude.assert_called_once_with("claude-opus-4-6", history)
+
+    def test_handle_chat_routes_image_turns_to_gemini(self) -> None:
+        history = [
+            {
+                "role": "user",
+                "content": "what is this?",
+                "attachments": [sample_attachment()],
+            }
+        ]
+        with mock.patch.object(backend, "read_history_from_stdin", return_value=history):
+            with mock.patch.object(backend, "stream_gemini", return_value=0) as stream_gemini:
+                result = backend.handle_chat("gemini::gemini-3-flash-preview")
+
+        self.assertEqual(result, 0)
+        stream_gemini.assert_called_once_with("gemini-3-flash-preview", history)
 
 
 if __name__ == "__main__":
