@@ -3515,7 +3515,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         panel.hasShadow = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
-        panel.isMovableByWindowBackground = true
+        panel.isMovableByWindowBackground = false
         panel.minSize = NSSize(width: 420, height: 70)
         panel.contentView = hostingView
         panel.orderOut(nil)
@@ -4216,7 +4216,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
     }
 }
 
-final class MovableHostingView<Content: View>: NSHostingView<Content> {}
+final class MovableHostingView<Content: View>: NSHostingView<Content> {
+    override var mouseDownCanMoveWindow: Bool { true }
+}
 
 @MainActor
 final class ChatPanelLayoutProxy: QuickAskLayoutDelegate {
