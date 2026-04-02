@@ -3558,6 +3558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         let resizeEnabled = !context.viewModel.messages.isEmpty
         let testOriginX: CGFloat = 700
         let testBottomY: CGFloat = 120
+        let visible = panel.screen?.visibleFrame ?? currentScreen()?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
 
         context.viewModel.setAutomaticPanelHeight(automaticHeight)
         if resizeEnabled {
@@ -3587,7 +3588,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             frame.origin.y = anchoredBottomY
             frame.size.width = automaticWidth
             frame.size.height = automaticHeight
-            context.panelBottomY = anchoredBottomY
+            frame = clampedPanelFrame(frame, in: visible)
+            context.panelBottomY = frame.minY
             context.userResizedSize = nil
             context.viewModel.setManualExtraHistoryHeight(0)
         } else {
@@ -3600,7 +3602,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             frame.origin.y = anchoredBottomY
             frame.size.height = targetHeight
             frame.size.width = targetWidth
-            context.panelBottomY = anchoredBottomY
+            frame = clampedPanelFrame(frame, in: visible)
+            context.panelBottomY = frame.minY
         }
         panel.setFrame(frame, display: true)
         if let anchoredBottomY = context.panelBottomY {
@@ -4083,6 +4086,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         let x = round(visible.midX - (width / 2))
         let y = round(visible.minY + 90)
         return NSRect(x: x, y: y, width: width, height: height)
+    }
+
+    private func clampedPanelFrame(_ frame: NSRect, in visible: NSRect) -> NSRect {
+        var clamped = frame
+        clamped.size.width = min(max(frame.width, 420), visible.width)
+        clamped.size.height = min(max(frame.height, 44), visible.height)
+        clamped.origin.x = min(max(frame.origin.x, visible.minX), visible.maxX - clamped.width)
+        clamped.origin.y = min(max(frame.origin.y, visible.minY), visible.maxY - clamped.height)
+        return NSRect(
+            x: round(clamped.origin.x),
+            y: round(clamped.origin.y),
+            width: round(clamped.width),
+            height: round(clamped.height)
+        )
     }
 
     private func acquireSingletonLock() -> Bool {
