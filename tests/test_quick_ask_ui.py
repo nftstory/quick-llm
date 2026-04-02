@@ -530,6 +530,19 @@ class QuickAskUITests(unittest.TestCase):
             self.assertAlmostEqualPx(restored["panelFrame"]["width"], 560.0)
             self.assertNotEqual(restored["panelFrame"]["height"], 260.0)
 
+    def test_panel_vertical_resize_can_grow_downward_after_conversation_starts(self) -> None:
+        with QuickAskHarness() as app:
+            app.command("show_panel")
+            app.command("set_input", text="hello")
+            app.command("submit")
+            with_history = app.command("complete_generation", text="reply")
+            original_top = with_history["panelFrame"]["y"] + with_history["panelFrame"]["height"]
+
+            resized = app.command("resize_panel", text="560|260|top")
+            self.assertAlmostEqualPx(resized["panelFrame"]["height"], 260.0)
+            resized_top = resized["panelFrame"]["y"] + resized["panelFrame"]["height"]
+            self.assertAlmostEqualPx(resized_top, original_top)
+
     def test_duplicate_launch_does_not_open_panel(self) -> None:
         with QuickAskHarness(enable_singleton=True) as app:
             initial = app.read_state()

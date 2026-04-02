@@ -279,17 +279,6 @@ private struct InputBarFrameKey: PreferenceKey {
     }
 }
 
-private struct PanelSizeKey: PreferenceKey {
-    static var defaultValue: CGSize = .zero
-
-    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
-        let next = nextValue()
-        if next.width > 0, next.height > 0 {
-            value = next
-        }
-    }
-}
-
 private enum QuickAskTheme {
     static let frameBackground = Color(red: 0.55, green: 0.79, blue: 0.77)
     static let historyBackground = Color(red: 0.55, green: 0.79, blue: 0.77)
@@ -611,7 +600,7 @@ private struct QuickAskUITestCommand: Codable {
 @MainActor
 protocol QuickAskLayoutDelegate: AnyObject {
     func quickAskNeedsLayout()
-    func quickAskResizePanel(to size: CGSize)
+    func quickAskResizePanel(to size: CGSize, preserveTopEdge: Bool, preserveRightEdge: Bool)
 }
 
 @MainActor
@@ -2809,13 +2798,134 @@ final class SuggestionFreeTextField: NSTextField {
     }
 }
 
+struct WindowDragSurface: NSViewRepresentable {
+    final class SurfaceView: NSView {
+        override var mouseDownCanMoveWindow: Bool { true }
+    }
+
+    func makeNSView(context: Context) -> SurfaceView {
+        let view = SurfaceView(frame: .zero)
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+        return view
+    }
+
+    func updateNSView(_ nsView: SurfaceView, context: Context) {}
+}
+
+struct PanelEdgeResizeOverlay: NSViewRepresentable {
+    let enabled: Bool
+    let onResize: (CGSize, Bool, Bool) -> Void
+
+    struct ResizeEdge: OptionSet {
+        let rawValue: Int
+
+        static let top = ResizeEdge(rawValue: 1 << 0)
+        static let bottom = ResizeEdge(rawValue: 1 << 1)
+        static let left = ResizeEdge(rawValue: 1 << 2)
+        static let right = ResizeEdge(rawValue: 1 << 3)
+    }
+
+    final class OverlayView: NSView {
+        var enabled = false
+        var onResize: ((CGSize, Bool, Bool) -> Void)?
+
+        private var activeEdges: ResizeEdge = []
+        private var dragStartScreenPoint: NSPoint?
+        private var dragStartSize: CGSize = .zero
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard enabled, !resizeEdges(at: point).isEmpty else { return nil }
+            return self
+        }
+
+        override func resetCursorRects() {
+            guard enabled else { return }
+            let edgeInset: CGFloat = 6
+            addCursorRect(NSRect(x: 0, y: 0, width: bounds.width, height: edgeInset), cursor: .resizeUpDown)
+            addCursorRect(NSRect(x: 0, y: bounds.height - edgeInset, width: bounds.width, height: edgeInset), cursor: .resizeUpDown)
+            addCursorRect(NSRect(x: 0, y: 0, width: edgeInset, height: bounds.height), cursor: .resizeLeftRight)
+            addCursorRect(NSRect(x: bounds.width - edgeInset, y: 0, width: edgeInset, height: bounds.height), cursor: .resizeLeftRight)
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            let point = convert(event.locationInWindow, from: nil)
+            activeEdges = resizeEdges(at: point)
+            guard !activeEdges.isEmpty else { return }
+            dragStartScreenPoint = NSEvent.mouseLocation
+            dragStartSize = window?.frame.size ?? .zero
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard enabled, !activeEdges.isEmpty, let dragStartScreenPoint else { return }
+            let currentPoint = NSEvent.mouseLocation
+            let deltaX = currentPoint.x - dragStartScreenPoint.x
+            let deltaY = currentPoint.y - dragStartScreenPoint.y
+
+            var requestedWidth = dragStartSize.width
+            var requestedHeight = dragStartSize.height
+            let preserveRightEdge = activeEdges.contains(.left)
+            let preserveTopEdge = activeEdges.contains(.bottom)
+
+            if activeEdges.contains(.right) {
+                requestedWidth += deltaX
+            } else if activeEdges.contains(.left) {
+                requestedWidth -= deltaX
+            }
+
+            if activeEdges.contains(.top) {
+                requestedHeight += deltaY
+            } else if activeEdges.contains(.bottom) {
+                requestedHeight -= deltaY
+            }
+
+            onResize?(CGSize(width: requestedWidth, height: requestedHeight), preserveTopEdge, preserveRightEdge)
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            activeEdges = []
+            dragStartScreenPoint = nil
+        }
+
+        private func resizeEdges(at point: NSPoint) -> ResizeEdge {
+            guard enabled else { return [] }
+            let edgeInset: CGFloat = 6
+            var edges: ResizeEdge = []
+            if point.y >= bounds.height - edgeInset {
+                edges.insert(.top)
+            }
+            if point.y <= edgeInset {
+                edges.insert(.bottom)
+            }
+            if point.x <= edgeInset {
+                edges.insert(.left)
+            }
+            if point.x >= bounds.width - edgeInset {
+                edges.insert(.right)
+            }
+            return edges
+        }
+    }
+
+    func makeNSView(context: Context) -> OverlayView {
+        let view = OverlayView(frame: .zero)
+        view.enabled = enabled
+        view.onResize = onResize
+        return view
+    }
+
+    func updateNSView(_ nsView: OverlayView, context: Context) {
+        nsView.enabled = enabled
+        nsView.onResize = onResize
+        nsView.window?.invalidateCursorRects(for: nsView)
+    }
+}
+
 struct QuickAskView: View {
     @ObservedObject var viewModel: QuickAskViewModel
     let onOpenHistory: () -> Void
     let onOpenSettings: () -> Void
     private let chatBottomAnchorID = "quick-ask-chat-bottom-anchor"
-    @State private var currentPanelSize = CGSize(width: 560, height: 70)
-    @State private var resizeStartSize: CGSize?
 
     private func actionButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(title, action: action)
@@ -2828,40 +2938,9 @@ struct QuickAskView: View {
             .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
     }
 
-    private var canResizePanel: Bool {
-        !viewModel.messages.isEmpty
-    }
-
     private var extraHistoryHeight: CGFloat {
-        guard canResizePanel else { return 0 }
+        guard !viewModel.messages.isEmpty else { return 0 }
         return viewModel.manualExtraHistoryHeight
-    }
-
-    private var resizeHandle: some View {
-        Image(systemName: "arrow.up.left.and.arrow.down.right")
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(QuickAskTheme.mutedText)
-            .frame(width: 20, height: 20)
-            .background(QuickAskTheme.inputBackground.opacity(0.96))
-            .overlay(Rectangle().stroke(QuickAskTheme.dividerColor, lineWidth: 1))
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        if resizeStartSize == nil {
-                            resizeStartSize = currentPanelSize
-                        }
-                        let start = resizeStartSize ?? currentPanelSize
-                        let requested = CGSize(
-                            width: start.width + value.translation.width,
-                            height: start.height - value.translation.height
-                        )
-                        viewModel.layoutDelegate?.quickAskResizePanel(to: requested)
-                    }
-                    .onEnded { _ in
-                        resizeStartSize = nil
-                    }
-            )
     }
 
     var body: some View {
@@ -3060,30 +3139,23 @@ struct QuickAskView: View {
             }
         }
         .frame(minWidth: 560, maxWidth: .infinity)
+        .background(WindowDragSurface())
         .background(QuickAskTheme.frameBackground)
-        .background(
-            GeometryReader { proxy in
-                Color.clear.preference(key: PanelSizeKey.self, value: proxy.size)
+        .overlay(
+            PanelEdgeResizeOverlay(enabled: !viewModel.messages.isEmpty) { requested, preserveTopEdge, preserveRightEdge in
+                viewModel.layoutDelegate?.quickAskResizePanel(
+                    to: requested,
+                    preserveTopEdge: preserveTopEdge,
+                    preserveRightEdge: preserveRightEdge
+                )
             }
         )
-        .overlay(alignment: .bottomTrailing) {
-            if canResizePanel {
-                resizeHandle
-                    .padding(.trailing, 6)
-                    .padding(.bottom, 6)
-            }
-        }
         .environment(\.openURL, OpenURLAction { url in
             NSWorkspace.shared.open(url)
             return .handled
         })
         .onPreferenceChange(InputBarFrameKey.self) { value in
             viewModel.setInputBarFrame(value)
-        }
-        .onPreferenceChange(PanelSizeKey.self) { value in
-            if value.width > 0, value.height > 0 {
-                currentPanelSize = value
-            }
         }
     }
 
@@ -3468,9 +3540,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         quickAskNeedsLayout(for: primaryPanelContext.id)
     }
 
-    func quickAskResizePanel(to size: CGSize) {
+    func quickAskResizePanel(to size: CGSize, preserveTopEdge: Bool, preserveRightEdge: Bool) {
         let context = activeChatPanelContext(preferVisible: false) ?? primaryPanelContext
-        resizeChatPanel(for: context.id, to: size)
+        resizeChatPanel(for: context.id, to: size, preserveTopEdge: preserveTopEdge, preserveRightEdge: preserveRightEdge)
     }
 
     func quickAskNeedsLayout(for panelID: UUID) {
@@ -3543,28 +3615,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
         uiTestHarness?.writeState()
     }
 
-    func resizeChatPanel(for panelID: UUID, to requestedSize: CGSize) {
+    func resizeChatPanel(for panelID: UUID, to requestedSize: CGSize, preserveTopEdge: Bool = false, preserveRightEdge: Bool = false) {
         guard let context = chatPanelContext(for: panelID) else { return }
         guard !context.viewModel.messages.isEmpty else { return }
 
         let panel = context.panel
         let visible = panel.screen?.visibleFrame ?? currentScreen()?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let anchoredBottomY = round(context.panelBottomY ?? panel.frame.minY)
-        let maxWidth = max(560, floor(visible.width))
+        let currentFrame = panel.frame
+        let anchoredLeftX = round(currentFrame.minX)
+        let anchoredRightX = round(currentFrame.maxX)
+        let anchoredBottomY = round(context.panelBottomY ?? currentFrame.minY)
+        let anchoredTopY = round(currentFrame.maxY)
+        let maxWidth = preserveRightEdge
+            ? max(560, floor(anchoredRightX - visible.minX))
+            : max(560, floor(visible.maxX - anchoredLeftX))
         let minHeight = max(70, context.viewModel.automaticPanelHeight)
-        let maxHeight = max(minHeight, floor(visible.maxY - anchoredBottomY))
+        let maxHeight = preserveTopEdge
+            ? max(minHeight, floor(anchoredTopY - visible.minY))
+            : max(minHeight, floor(visible.maxY - anchoredBottomY))
         let clampedWidth = round(min(max(560, requestedSize.width), maxWidth))
         let clampedHeight = round(min(max(minHeight, requestedSize.height), maxHeight))
         let extraHistoryHeight = max(0, clampedHeight - context.viewModel.automaticPanelHeight)
+        let targetLeftX = preserveRightEdge ? round(anchoredRightX - clampedWidth) : anchoredLeftX
+        let targetBottomY = preserveTopEdge ? round(anchoredTopY - clampedHeight) : anchoredBottomY
 
         context.isProgrammaticMove = true
         context.viewModel.setManualExtraHistoryHeight(extraHistoryHeight)
         context.userResizedSize = NSSize(width: clampedWidth, height: clampedHeight)
-        context.panelBottomY = anchoredBottomY
+        context.panelBottomY = targetBottomY
         quickAskNeedsLayout(for: panelID)
-        var frame = panel.frame
-        frame.origin.x = min(max(frame.origin.x, visible.minX), visible.maxX - frame.width)
-        panel.setFrameOrigin(frame.origin)
+        let clampedOriginX = min(max(targetLeftX, visible.minX), visible.maxX - panel.frame.width)
+        panel.setFrameOrigin(NSPoint(x: clampedOriginX, y: targetBottomY))
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             self?.chatPanelContext(for: panelID)?.isProgrammaticMove = false
             self?.uiTestHarness?.writeState()
@@ -4253,11 +4334,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
             activeContext.viewModel.touch()
             quickAskNeedsLayout(for: activeContext.id)
         case "resize_panel":
-            if let text = command.text,
-               let separator = text.lastIndex(of: "|"),
-               let width = Double(String(text[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)),
-               let height = Double(String(text[text.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)) {
-                resizeChatPanel(for: activeContext.id, to: CGSize(width: width, height: height))
+            if let text = command.text {
+                let parts = text.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+                if parts.count >= 2,
+                   let width = Double(parts[0].trimmingCharacters(in: .whitespacesAndNewlines)),
+                   let height = Double(parts[1].trimmingCharacters(in: .whitespacesAndNewlines)) {
+                    let mode = parts.count >= 3 ? parts[2].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() : ""
+                    let preserveTopEdge = mode.contains("top")
+                    let preserveRightEdge = mode.contains("right")
+                    resizeChatPanel(
+                        for: activeContext.id,
+                        to: CGSize(width: width, height: height),
+                        preserveTopEdge: preserveTopEdge,
+                        preserveRightEdge: preserveRightEdge
+                    )
+                }
             }
         case "show_settings":
             showSettingsWindow()
@@ -4362,7 +4453,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, QuickAskLayoutDelegate
 }
 
 final class MovableHostingView<Content: View>: NSHostingView<Content> {
-    override var mouseDownCanMoveWindow: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
 }
 
 @MainActor
@@ -4379,8 +4470,8 @@ final class ChatPanelLayoutProxy: QuickAskLayoutDelegate {
         appDelegate?.quickAskNeedsLayout(for: panelID)
     }
 
-    func quickAskResizePanel(to size: CGSize) {
-        appDelegate?.resizeChatPanel(for: panelID, to: size)
+    func quickAskResizePanel(to size: CGSize, preserveTopEdge: Bool, preserveRightEdge: Bool) {
+        appDelegate?.resizeChatPanel(for: panelID, to: size, preserveTopEdge: preserveTopEdge, preserveRightEdge: preserveRightEdge)
     }
 }
 
